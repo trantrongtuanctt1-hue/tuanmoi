@@ -19,7 +19,7 @@ class Scanner:
     def __init__(
         self,
         fetcher: BybitFetcher,
-        min_score: int = 7,
+        min_score: int = 5,
         max_symbols: int = 500,
     ):
         self.fetcher      = fetcher
