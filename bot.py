@@ -1,120 +1,82 @@
 """
-Telegram bot — commands: /scan /top /check /status /help
+Scanner — quét tối đa 500 token song song, cooldown chống spam
 """
+import asyncio
 import logging
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+import time
+from typing import Optional
 
-from scanner import Scanner
-from signals import SignalResult
+from fetcher import BybitFetcher
+from signals import SignalResult, score_symbol
 
 logger = logging.getLogger(__name__)
 
-
-def _format_signal(r: SignalResult) -> str:
-    emoji  = "🟢" if r.direction == "LONG" else ("🔴" if r.direction == "SHORT" else "⚪")
-    tags   = " | ".join(r.reasons[:6])
-    return (
-        f"{emoji} *{r.symbol}* [{r.direction}] Score: {r.score}/11\n"
-        f"💰 Price : `{r.price}`\n"
-        f"🛑 SL    : `{r.sl}`\n"
-        f"🎯 TP1   : `{r.tp1}`\n"
-        f"🎯 TP2   : `{r.tp2}`\n"
-        f"📊 Tags  : {tags}"
-    )
+COOLDOWN_SECONDS = 900   # 15 phút giữa 2 alert cùng symbol
+CONCURRENCY      = 20    # số coroutines song song
 
 
-class TelegramBot:
-    def __init__(self, token: str, scanner: Scanner):
-        self.token   = token
-        self.scanner = scanner
-        self.app     = Application.builder().token(token).build()
-        self._register()
+class Scanner:
+    def __init__(
+        self,
+        fetcher: BybitFetcher,
+        min_score: int = 5,
+        max_symbols: int = 500,
+    ):
+        self.fetcher      = fetcher
+        self.min_score    = min_score
+        self.max_symbols  = max_symbols
+        self._last_alert: dict[str, float] = {}
 
-    def _register(self):
-        self.app.add_handler(CommandHandler("start",  self._start))
-        self.app.add_handler(CommandHandler("help",   self._help))
-        self.app.add_handler(CommandHandler("scan",   self._scan))
-        self.app.add_handler(CommandHandler("top",    self._top))
-        self.app.add_handler(CommandHandler("check",  self._check))
-        self.app.add_handler(CommandHandler("status", self._status))
+    def _in_cooldown(self, symbol: str) -> bool:
+        last = self._last_alert.get(symbol, 0)
+        return (time.time() - last) < COOLDOWN_SECONDS
 
-    # ── handlers ────────────────────────────────────────────────────────────
+    def _mark_alert(self, symbol: str):
+        self._last_alert[symbol] = time.time()
 
-    async def _start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "🤖 *15M ULTRA Signal Bot* đã sẵn sàng!\n\n"
-            "Dùng /help để xem lệnh.",
-            parse_mode="Markdown",
-        )
-
-    async def _help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "📖 *Lệnh*\n"
-            "/scan — Quét toàn bộ 500 token, gửi tín hiệu mạnh\n"
-            "/top — Top 5 tín hiệu mới nhất\n"
-            "/check BTC — Phân tích 1 token cụ thể\n"
-            "/status — Trạng thái bot\n",
-            parse_mode="Markdown",
-        )
-
-    async def _scan(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🔍 Đang quét 500 token... (~60s)")
-        signals = await self.scanner.scan_all()
-        if not signals:
-            await update.message.reply_text("❌ Không có tín hiệu đủ mạnh lúc này.")
-            return
-        for r in signals[:10]:
-            await update.message.reply_text(_format_signal(r), parse_mode="Markdown")
-        await update.message.reply_text(f"✅ Xong. Tổng: {len(signals)} tín hiệu.")
-
-    async def _top(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🔍 Đang lấy top tín hiệu...")
-        signals = await self.scanner.scan_all()
-        if not signals:
-            await update.message.reply_text("❌ Không có tín hiệu.")
-            return
-        for r in signals[:5]:
-            await update.message.reply_text(_format_signal(r), parse_mode="Markdown")
-
-    async def _check(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        args = ctx.args
-        if not args:
-            await update.message.reply_text("⚠️ Dùng: /check BTC hoặc /check BTCUSDT")
-            return
-        symbol = args[0].upper()
-        await update.message.reply_text(f"🔍 Đang phân tích {symbol}...")
-        r = await self.scanner.scan_symbol(symbol)
-        if r is None:
-            await update.message.reply_text(f"❌ Không đủ dữ liệu cho {symbol}.")
-            return
-        await update.message.reply_text(_format_signal(r), parse_mode="Markdown")
-
-    async def _status(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        cooldowns = len(self.scanner._last_alert)
-        await update.message.reply_text(
-            f"✅ Bot đang chạy\n"
-            f"📊 Tokens trong cooldown: {cooldowns}\n"
-            f"🎯 Min score: {self.scanner.min_score}/11\n"
-            f"🔢 Max tokens/scan: {self.scanner.max_symbols}"
-        )
-
-    # ── public API ──────────────────────────────────────────────────────────
-
-    async def send_signal(self, chat_id: str, result: SignalResult):
-        """Gọi từ scheduler để push alert tự động"""
+    async def _analyse_one(self, symbol: str) -> Optional[SignalResult]:
         try:
-            await self.app.bot.send_message(
-                chat_id    = chat_id,
-                text       = f"🚨 *AUTO ALERT*\n\n{_format_signal(result)}",
-                parse_mode = "Markdown",
+            df5, df15, df1h = await asyncio.gather(
+                self.fetcher.fetch_ohlcv(symbol, "5m",  200),
+                self.fetcher.fetch_ohlcv(symbol, "15m", 100),
+                self.fetcher.fetch_ohlcv(symbol, "1h",  100),
             )
-        except Exception as e:
-            logger.error(f"send_signal {chat_id}: {e}")
+            if df5 is None or len(df5) < 50:
+                return None
+            if df15 is None: df15 = df5
+            if df1h  is None: df1h  = df5
 
-    def run_polling(self):
-        self.app.run_polling(drop_pending_updates=True)
+            result = score_symbol(symbol, df5, df15, df1h)
+            return result if result.score >= self.min_score else None
+        except Exception as e:
+            logger.debug(f"{symbol}: {e}")
+            return None
+
+    async def scan_all(self) -> list[SignalResult]:
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(f"Scanning {len(symbols)} symbols…")
+
+        sem     = asyncio.Semaphore(CONCURRENCY)
+        signals: list[SignalResult] = []
+
+        async def limited(sym):
+            async with sem:
+                return await self._analyse_one(sym)
+
+        results = await asyncio.gather(*[limited(s) for s in symbols])
+
+        for r in results:
+            if r and not self._in_cooldown(r.symbol):
+                self._mark_alert(r.symbol)
+                signals.append(r)
+
+        signals.sort(key=lambda x: x.score, reverse=True)
+        logger.info(f"Found {len(signals)} signals ≥ {self.min_score}")
+        return signals
+
+    async def scan_symbol(self, symbol: str) -> Optional[SignalResult]:
+        """Quét 1 token theo yêu cầu (bỏ qua cooldown)"""
+        sym = symbol.upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+        return await self._analyse_one(sym)
