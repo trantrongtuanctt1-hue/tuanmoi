@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.fetcher  import BinanceFetcher
+from src.fetcher  import BybitFetcher
 from src.scanner  import Scanner
 from src.bot      import SignalBot
 
@@ -53,7 +53,7 @@ async def main():
     logger.info("Starting 15M ULTRA Signal Bot...")
 
     # ── Binance ───────────────────────────────────────────────────────────
-    fetcher = BinanceFetcher(BINANCE_API_KEY, BINANCE_SECRET)
+    fetcher = BybitFetcher(BINANCE_API_KEY, BINANCE_SECRET)
     await fetcher.connect()
 
     # ── Scanner ───────────────────────────────────────────────────────────
