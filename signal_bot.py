@@ -94,25 +94,42 @@ class TelegramBot:
     async def _debug(self, u: Update, c):
         """Kiểm tra fetch + score cho BTC/ETH/SOL."""
         await u.message.reply_text("🔧 Đang debug...")
+        import aiohttp, traceback
         fetcher = self.scanner.fetcher
         lines = []
+
+        # 1. Test raw HTTP tới Binance
+        try:
+            session = await fetcher._get_session()
+            async with session.get(
+                "https://fapi.binance.com/fapi/v1/ping", timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                lines.append(f"🌐 Binance ping: HTTP {resp.status}")
+        except Exception as e:
+            lines.append(f"🌐 Binance ping FAILED: {type(e).__name__}: {e}")
+
+        # 2. Test fetch OHLCV với error chi tiết
         for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
-            df = await fetcher.fetch_ohlcv(sym, "5m", 50)
-            if df is None or len(df) == 0:
-                lines.append(f"❌ {sym}: fetch failed (API không kết nối được)")
-            else:
-                from signals import score_symbol
-                df15 = await fetcher.fetch_ohlcv(sym, "15m", 50) or df
-                df1h = await fetcher.fetch_ohlcv(sym, "1h",  50) or df
-                r = score_symbol(sym, df, df15, df1h)
-                lines.append(
-                    f"✅ {sym}: {len(df)} bars | close={df.close.iloc[-1]:.4f}\n"
-                    f"   Score={r.score}/10 [{r.direction}] {r.reasons}"
-                )
-        # Also check symbol list
+            try:
+                session = await fetcher._get_session()
+                async with session.get(
+                    "https://fapi.binance.com/fapi/v1/klines",
+                    params={"symbol": sym, "interval": "5m", "limit": 5},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    status = resp.status
+                    body = await resp.text()
+                    if status == 200:
+                        lines.append(f"✅ {sym}: HTTP 200 OK — {body[:80]}")
+                    else:
+                        lines.append(f"❌ {sym}: HTTP {status} — {body[:120]}")
+            except Exception as e:
+                lines.append(f"❌ {sym}: {type(e).__name__}: {str(e)[:120]}")
+
+        # 3. Symbol list
         syms = await fetcher.fetch_top_symbols(10)
         lines.append(f"\n📋 Symbol list ({len(syms)} total): {syms[:5]}")
-        lines.append(f"🎯 Min score threshold: {self.scanner.min_score}")
+        lines.append(f"🎯 Min score: {self.scanner.min_score}")
 
         await u.message.reply_text("\n".join(lines))
 
