@@ -1,5 +1,6 @@
 """
 Scanner — quét tối đa 500 token song song, cooldown chống spam
+v3.0: fetch 6 TF (5m, 15m, 30m, 1h, 4h, 1d) cho ULTRA scoring
 """
 import asyncio
 import logging
@@ -12,7 +13,7 @@ from signals import SignalResult, score_symbol
 logger = logging.getLogger(__name__)
 
 COOLDOWN_SECONDS = 900   # 15 phút giữa 2 alert cùng symbol
-CONCURRENCY      = 50    # số coroutines song song
+CONCURRENCY      = 30    # giảm từ 50 → 30 vì mỗi symbol giờ fetch 6 TF
 
 
 class Scanner:
@@ -36,25 +37,50 @@ class Scanner:
 
     async def _analyse_one(self, symbol: str) -> Optional[SignalResult]:
         try:
-            df5, df15, df1h = await asyncio.gather(
-                self.fetcher.fetch_ohlcv(symbol, "5m",  200),
-                self.fetcher.fetch_ohlcv(symbol, "15m", 100),
-                self.fetcher.fetch_ohlcv(symbol, "1h",  100),
+            # Fetch 6 timeframes đồng thời
+            df5, df15, df30, df1h, df4h, df1d = await asyncio.gather(
+                self.fetcher.fetch_ohlcv(symbol, "5m",  100),
+                self.fetcher.fetch_ohlcv(symbol, "15m",  60),
+                self.fetcher.fetch_ohlcv(symbol, "30m",  60),
+                self.fetcher.fetch_ohlcv(symbol, "1h",   60),
+                self.fetcher.fetch_ohlcv(symbol, "4h",   60),
+                self.fetcher.fetch_ohlcv(symbol, "1d",   60),
             )
+
+            # Bắt buộc có 5m (để SXL engine chạy)
             if df5 is None or len(df5) < 50:
                 return None
-            if df15 is None: df15 = df5
-            if df1h  is None: df1h  = df5
 
-            result = score_symbol(symbol, df5, df15, df1h)
-            return result if result.score >= self.min_score else None
+            # 15m fallback về 5m nếu fetch lỗi
+            if df15 is None or len(df15) < 20:
+                df15 = df5
+
+            result = score_symbol(
+                symbol,
+                df_5m  = df5,
+                df_15m = df15,
+                df_1h  = df1h,
+                df_30m = df30,
+                df_4h  = df4h,
+                df_1d  = df1d,
+            )
+
+            # Threshold: dùng ultra_buy/sell score làm tiêu chí chính
+            # Nếu ultra score ≥5 HOẶC sxl score ≥ min_score → giữ
+            passes = (
+                result.ultra_buy_score  >= self.min_score or
+                result.ultra_sell_score >= self.min_score or
+                result.score            >= self.min_score
+            )
+            return result if passes else None
+
         except Exception as e:
             logger.debug(f"{symbol}: {e}")
             return None
 
     async def scan_all(self) -> list[SignalResult]:
         symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
-        logger.info(f"Scanning {len(symbols)} symbols…")
+        logger.info(f"Scanning {len(symbols)} symbols (6 TF each)…")
 
         sem     = asyncio.Semaphore(CONCURRENCY)
         signals: list[SignalResult] = []
@@ -70,12 +96,16 @@ class Scanner:
                 self._mark_alert(r.symbol)
                 signals.append(r)
 
-        signals.sort(key=lambda x: x.score, reverse=True)
+        # Sắp xếp: ưu tiên ultra score, sau đó sxl score
+        signals.sort(
+            key=lambda x: (max(x.ultra_buy_score, x.ultra_sell_score), x.score),
+            reverse=True,
+        )
         logger.info(f"Found {len(signals)} signals ≥ {self.min_score}")
         return signals
 
     async def scan_symbol(self, symbol: str) -> Optional[SignalResult]:
-        """Quét 1 token theo yêu cầu (bỏ qua cooldown)"""
+        """Quét 1 token theo yêu cầu (bỏ qua cooldown)."""
         sym = symbol.upper()
         if not sym.endswith("USDT"):
             sym += "USDT"
