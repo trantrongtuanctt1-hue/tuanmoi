@@ -1,190 +1,173 @@
 """
-Signal engine — port of 15M ULTRA v2.2 Pine Script logic
-Indicators: Supertrend AI, UT Bot, SAR, SMC structure, RSI, MTF
-Score: 0–11 points
+Signal engine — 15M ULTRA v2.2 port
+Score: 0–10 points. Ngưỡng alert mặc định: 5
+Rebalanced để cho tín hiệu thực tế hơn.
 """
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
 class SignalResult:
-    symbol: str
-    score: int
+    symbol:    str
+    score:     int
     direction: str          # "LONG" | "SHORT" | "NEUTRAL"
-    price: float
-    sl: float
-    tp1: float
-    tp2: float
-    reasons: list[str]
+    price:     float
+    sl:        float
+    tp1:       float
+    tp2:       float
+    reasons:   list[str] = field(default_factory=list)
     timeframe: str = "5m"
 
 
-# ─── helpers ────────────────────────────────────────────────────────────────
+# ── helpers ─────────────────────────────────────────────────────────────────
 
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+def _ema(s: pd.Series, p: int) -> pd.Series:
+    return s.ewm(span=p, adjust=False).mean()
 
-
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def _atr(df: pd.DataFrame, p: int = 14) -> pd.Series:
     hl = df["high"] - df["low"]
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"]  - df["close"].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
+    return pd.concat([hl, hc, lc], axis=1).max(axis=1).ewm(span=p, adjust=False).mean()
+
+def _rsi(close: pd.Series, p: int = 14) -> pd.Series:
+    d = close.diff()
+    g = d.clip(lower=0).ewm(span=p, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(span=p, adjust=False).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
 
 
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    delta = close.diff()
-    gain  = delta.clip(lower=0).ewm(span=period, adjust=False).mean()
-    loss  = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+# ── indicators ───────────────────────────────────────────────────────────────
 
-
-# ─── individual indicators ──────────────────────────────────────────────────
-
-def supertrend(df: pd.DataFrame, period: int = 10, mult: float = 3.0):
-    atr  = _atr(df, period)
+def supertrend_bull(df: pd.DataFrame, p: int = 10, mult: float = 3.0) -> bool:
+    """Returns True if last candle is in bullish supertrend."""
+    if len(df) < p + 2:
+        return False
+    atr  = _atr(df, p)
     hl2  = (df["high"] + df["low"]) / 2
     upper = hl2 + mult * atr
     lower = hl2 - mult * atr
-
-    st   = pd.Series(index=df.index, dtype=float)
-    bull = pd.Series(True, index=df.index)
-
+    bull = True
+    st   = upper.iloc[0]
     for i in range(1, len(df)):
-        prev_st   = st.iloc[i - 1] if i > 1 else upper.iloc[i]
-        prev_bull = bull.iloc[i - 1] if i > 1 else True
-        close     = df["close"].iloc[i]
-
-        if prev_bull:
-            cur_st = max(lower.iloc[i], prev_st) if close > prev_st else upper.iloc[i]
-            bull.iloc[i] = close > cur_st
+        c = df["close"].iloc[i]
+        if bull:
+            st = max(lower.iloc[i], st)
+            if c < st:
+                bull = False; st = upper.iloc[i]
         else:
-            cur_st = min(upper.iloc[i], prev_st) if close < prev_st else lower.iloc[i]
-            bull.iloc[i] = close > cur_st
-        st.iloc[i] = cur_st
+            st = min(upper.iloc[i], st)
+            if c > st:
+                bull = True;  st = lower.iloc[i]
+    return bull
 
-    return bull  # True = bullish
 
-
-def ut_bot(df: pd.DataFrame, sensitivity: float = 1.0, atr_period: int = 10):
-    """UT Bot Alert — returns Series: 1 buy, -1 sell, 0 neutral"""
-    atr    = _atr(df, atr_period) * sensitivity
-    close  = df["close"]
-    trail  = pd.Series(index=df.index, dtype=float)
-    signal = pd.Series(0, index=df.index, dtype=int)
-
+def ut_bot_signal(df: pd.DataFrame, sensitivity: float = 1.0, p: int = 10) -> int:
+    """1 = buy cross, -1 = sell cross, 0 = none (checks last 3 bars)."""
+    if len(df) < p + 3:
+        return 0
+    atr   = _atr(df, p) * sensitivity
+    close = df["close"]
+    trail = [close.iloc[0]]
     for i in range(1, len(df)):
-        prev  = trail.iloc[i - 1] if i > 1 else close.iloc[i]
-        c     = close.iloc[i]
-        a     = atr.iloc[i]
-        if c > prev:
-            trail.iloc[i] = max(prev, c - a)
-        else:
-            trail.iloc[i] = min(prev, c + a)
-        if close.iloc[i - 1] < trail.iloc[i - 1] and c > trail.iloc[i]:
-            signal.iloc[i] = 1
-        elif close.iloc[i - 1] > trail.iloc[i - 1] and c < trail.iloc[i]:
-            signal.iloc[i] = -1
-
-    return signal
+        c = close.iloc[i]; a = atr.iloc[i]; prev = trail[-1]
+        trail.append(max(prev, c - a) if c > prev else min(prev, c + a))
+    # Check last 3 bars for a recent cross
+    for i in range(len(df)-3, len(df)-1):
+        if close.iloc[i-1] < trail[i-1] and close.iloc[i] > trail[i]:
+            return 1
+        if close.iloc[i-1] > trail[i-1] and close.iloc[i] < trail[i]:
+            return -1
+    return 0
 
 
-def parabolic_sar(df: pd.DataFrame, step: float = 0.02, max_af: float = 0.2):
-    """Returns Series: True = price above SAR (bullish)"""
+def sar_bull(df: pd.DataFrame, step: float = 0.02, max_af: float = 0.2) -> bool:
+    """True = price above SAR (bullish)."""
+    if len(df) < 3:
+        return False
     close = df["close"].values
     high  = df["high"].values
     low   = df["low"].values
-    n     = len(df)
-    sar   = np.zeros(n)
-    bull  = np.ones(n, dtype=bool)
-    af    = step
-    ep    = low[0]
-    sar[0] = high[0]
-
-    for i in range(1, n):
-        if bull[i - 1]:
-            sar[i] = sar[i - 1] + af * (ep - sar[i - 1])
-            sar[i] = min(sar[i], low[i - 1], low[max(0, i - 2)])
-            if low[i] < sar[i]:
-                bull[i] = False
-                sar[i]  = ep
-                ep       = low[i]
-                af       = step
+    bull  = True; af = step; ep = high[0]; sar = low[0]
+    for i in range(1, len(df)):
+        if bull:
+            sar = sar + af * (ep - sar)
+            sar = min(sar, low[i-1], low[max(0,i-2)])
+            if low[i] < sar:
+                bull = False; sar = ep; ep = low[i]; af = step
             else:
-                bull[i] = True
-                if high[i] > ep:
-                    ep = high[i]
-                    af = min(af + step, max_af)
+                if high[i] > ep: ep = high[i]; af = min(af+step, max_af)
         else:
-            sar[i] = sar[i - 1] + af * (ep - sar[i - 1])
-            sar[i] = max(sar[i], high[i - 1], high[max(0, i - 2)])
-            if high[i] > sar[i]:
-                bull[i] = True
-                sar[i]  = ep
-                ep       = high[i]
-                af       = step
+            sar = sar + af * (ep - sar)
+            sar = max(sar, high[i-1], high[max(0,i-2)])
+            if high[i] > sar:
+                bull = True; sar = ep; ep = high[i]; af = step
             else:
-                bull[i] = False
-                if low[i] < ep:
-                    ep = low[i]
-                    af = min(af + step, max_af)
-
-    return pd.Series(bull, index=df.index)
+                if low[i] < ep: ep = low[i]; af = min(af+step, max_af)
+    return bull
 
 
-def smc_score(df: pd.DataFrame) -> tuple[int, list[str]]:
+def ema_trend(df: pd.DataFrame) -> int:
     """
-    Smart Money Concept mini-score (0–4):
-    - BOS (Break of Structure)
-    - OB (Order Block proximity)
-    - FVG (Fair Value Gap)
-    - Liquidity sweep
+    +2 if 9>21>50 (strong bull stack)
+    +1 if 9>21
+     0 if mixed
+    -1 if 9<21
     """
-    score   = 0
-    reasons = []
-    close   = df["close"]
-    high    = df["high"]
-    low     = df["low"]
+    c    = df["close"]
+    e9   = _ema(c, 9).iloc[-1]
+    e21  = _ema(c, 21).iloc[-1]
+    e50  = _ema(c, 50).iloc[-1]
+    if e9 > e21 > e50:
+        return 2
+    if e9 > e21:
+        return 1
+    if e9 < e21:
+        return -1
+    return 0
 
-    # BOS: recent high broken
+
+def rsi_score(df: pd.DataFrame) -> tuple[int, float]:
+    """
+    Bullish:  >50 = +1, 50-70 = +1 more (ideal zone)
+    Bearish: <50 = -1, 30-50 = -1 more
+    Returns (score_delta, rsi_value)
+    """
+    rsi = _rsi(df["close"]).iloc[-1]
+    if rsi >= 50:
+        pts = 1 + (1 if rsi <= 72 else 0)
+    else:
+        pts = -1 + (-1 if rsi >= 28 else 0)
+    return pts, rsi
+
+
+def volume_confirm(df: pd.DataFrame) -> bool:
+    """Last candle volume > 1.3x 20-bar average."""
+    if len(df) < 21:
+        return False
+    avg = df["volume"].iloc[-21:-1].mean()
+    return df["volume"].iloc[-1] > avg * 1.3
+
+
+def smc_mini(df: pd.DataFrame) -> tuple[int, list[str]]:
+    """SMC: BOS + OB, max +2."""
+    score = 0; tags = []
+    close = df["close"]; high = df["high"]; low = df["low"]
+    # BOS up
     if close.iloc[-1] > high.iloc[-20:-1].max():
-        score += 1
-        reasons.append("BOS↑")
+        score += 1; tags.append("BOS↑")
     elif close.iloc[-1] < low.iloc[-20:-1].min():
-        score += 1
-        reasons.append("BOS↓")
-
-    # Order Block: last bearish candle before big bull move
+        score += 1; tags.append("BOS↓")
+    # Order block: big body candle nearby
     body = (df["close"] - df["open"]).abs()
-    big  = body.iloc[-10:-1]
-    if len(big) and big.max() > body.mean() * 1.5:
-        score += 1
-        reasons.append("OB")
-
-    # FVG: gap between candle[-3].high and candle[-1].low
-    if len(df) >= 3:
-        if low.iloc[-1] > high.iloc[-3]:
-            score += 1
-            reasons.append("FVG↑")
-        elif high.iloc[-1] < low.iloc[-3]:
-            score += 1
-            reasons.append("FVG↓")
-
-    # Liquidity sweep: wick below recent lows then close above
-    wick_low = low.iloc[-1]
-    prev_low = low.iloc[-20:-1].min()
-    if wick_low < prev_low and close.iloc[-1] > prev_low:
-        score += 1
-        reasons.append("LiqSweep")
-
-    return min(score, 4), reasons
+    if len(body) > 10 and body.iloc[-5:-1].max() > body.mean() * 1.8:
+        score += 1; tags.append("OB")
+    return min(score, 2), tags
 
 
-# ─── main scorer ────────────────────────────────────────────────────────────
+# ── main scorer ──────────────────────────────────────────────────────────────
 
 def score_symbol(
     symbol: str,
@@ -193,69 +176,67 @@ def score_symbol(
     df_1h:  pd.DataFrame,
 ) -> SignalResult:
     reasons: list[str] = []
-    score   = 0
-    close   = df_5m["close"].iloc[-1]
-    atr_val = _atr(df_5m).iloc[-1]
+    score = 0
+    close  = df_5m["close"].iloc[-1]
+    atr_v  = _atr(df_5m).iloc[-1]
 
-    # 1. Supertrend 5m (1 pt)
-    st_bull = supertrend(df_5m).iloc[-1]
-    if st_bull:
+    # 1. Supertrend MTF (+1 each, max +3)
+    if supertrend_bull(df_5m):
         score += 1; reasons.append("ST↑5m")
+    if len(df_15m) > 20 and supertrend_bull(df_15m):
+        score += 1; reasons.append("ST↑15m")
+    if len(df_1h)  > 20 and supertrend_bull(df_1h):
+        score += 1; reasons.append("ST↑1h")
 
-    # 2. Supertrend 15m (1 pt)
-    if len(df_15m) > 20:
-        st15 = supertrend(df_15m).iloc[-1]
-        if st15:
-            score += 1; reasons.append("ST↑15m")
-
-    # 3. Supertrend 1h (1 pt)
-    if len(df_1h) > 20:
-        st1h = supertrend(df_1h).iloc[-1]
-        if st1h:
-            score += 1; reasons.append("ST↑1h")
-
-    # 4. UT Bot 5m (1 pt)
-    ut = ut_bot(df_5m).iloc[-1]
+    # 2. UT Bot — widen window to last 3 bars (+1)
+    ut = ut_bot_signal(df_5m)
     if ut == 1:
         score += 1; reasons.append("UTBot↑")
 
-    # 5. Parabolic SAR (1 pt)
-    sar_bull = parabolic_sar(df_5m).iloc[-1]
-    if sar_bull:
+    # 3. SAR (+1)
+    if sar_bull(df_5m):
         score += 1; reasons.append("SAR↑")
 
-    # 6–7. RSI (2 pts)
-    rsi_val = _rsi(df_5m["close"]).iloc[-1]
-    if 45 < rsi_val < 70:
-        score += 1; reasons.append(f"RSI{rsi_val:.0f}")
-    if rsi_val > 50:
-        score += 1; reasons.append("RSI>50")
-
-    # 8. EMA cross (1 pt)
-    ema9  = _ema(df_5m["close"], 9).iloc[-1]
-    ema21 = _ema(df_5m["close"], 21).iloc[-1]
-    if ema9 > ema21:
+    # 4. EMA trend (+1 or +2)
+    et = ema_trend(df_5m)
+    if et == 2:
+        score += 2; reasons.append("EMA3x↑")
+    elif et == 1:
         score += 1; reasons.append("EMA↑")
 
-    # 9–11. SMC (up to 3 pts capped at 3)
-    smc, smc_r = smc_score(df_5m)
-    smc_pts = min(smc, 3)
+    # 5. RSI (±2)
+    rsi_pts, rsi_val = rsi_score(df_5m)
+    score += rsi_pts
+    if rsi_pts > 0:
+        reasons.append(f"RSI{rsi_val:.0f}↑")
+
+    # 6. Volume confirmation (+1)
+    if volume_confirm(df_5m):
+        score += 1; reasons.append("Vol↑")
+
+    # 7. SMC (+0 to +2)
+    smc_pts, smc_r = smc_mini(df_5m)
     score  += smc_pts
     reasons += smc_r
 
     # Direction
-    bull_count = sum(1 for r in reasons if "↑" in r or r.startswith("RSI"))
-    bear_count = sum(1 for r in reasons if "↓" in r)
-    direction  = "LONG" if bull_count >= 3 else ("SHORT" if bear_count >= 2 else "NEUTRAL")
+    bull_tags = sum(1 for r in reasons if "↑" in r)
+    bear_tags = sum(1 for r in reasons if "↓" in r)
+    direction = "LONG" if bull_tags > bear_tags else ("SHORT" if bear_tags > bull_tags else "NEUTRAL")
 
-    # SL/TP
-    sl  = close - 1.5 * atr_val if direction == "LONG" else close + 1.5 * atr_val
-    tp1 = close + 2.0 * atr_val if direction == "LONG" else close - 2.0 * atr_val
-    tp2 = close + 3.5 * atr_val if direction == "LONG" else close - 3.5 * atr_val
+    # SL / TP
+    if direction == "LONG":
+        sl  = close - 1.5 * atr_v
+        tp1 = close + 2.0 * atr_v
+        tp2 = close + 3.5 * atr_v
+    else:
+        sl  = close + 1.5 * atr_v
+        tp1 = close - 2.0 * atr_v
+        tp2 = close - 3.5 * atr_v
 
     return SignalResult(
         symbol    = symbol,
-        score     = min(score, 11),
+        score     = max(0, score),
         direction = direction,
         price     = round(close, 6),
         sl        = round(sl, 6),
