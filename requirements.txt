@@ -1,6 +1,7 @@
-ccxt==4.3.30
-python-telegram-bot==20.7
-pandas>=2.2.0
-numpy>=1.26.4
-python-dotenv>=1.0.1
+text
+ccxt==4.3.95
+python-telegram-bot==21.6
+pandas==2.2.2
+numpy==1.26.4
+python-dotenv==1.0.1
 aiohttp==3.9.5
