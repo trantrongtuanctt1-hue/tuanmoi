@@ -1,5 +1,5 @@
 """
-Telegram bot — commands: /scan /top /check /status /debug /help
+Telegram bot — commands: /scan /top /check /status /debug /source /help
 """
 import logging
 from telegram import Update
@@ -37,6 +37,7 @@ class TelegramBot:
             ("check",  self._check),
             ("status", self._status),
             ("debug",  self._debug),
+            ("source", self._source),
         ]:
             self.app.add_handler(CommandHandler(cmd, fn))
 
@@ -46,16 +47,17 @@ class TelegramBot:
     async def _help(self, u: Update, c):
         await u.message.reply_text(
             "📖 *Lệnh*\n"
-            "/scan — Quét 200 token, alert score ≥5\n"
+            "/scan — Quét token, alert score ≥5\n"
             "/top  — Top 5 tín hiệu mạnh nhất\n"
             "/check BTC — Phân tích 1 token\n"
-            "/debug — Kiểm tra kết nối + score BTC/ETH/SOL\n"
+            "/debug — Kiểm tra kết nối API\n"
+            "/source — Xem API đang dùng\n"
             "/status — Trạng thái bot\n",
             parse_mode="Markdown"
         )
 
     async def _scan(self, u: Update, c):
-        await u.message.reply_text("🔍 Đang quét 200 token... (~60s)")
+        await u.message.reply_text("🔍 Đang quét token... (~60s)")
         signals = await self.scanner.scan_all()
         if not signals:
             await u.message.reply_text(
@@ -91,47 +93,55 @@ class TelegramBot:
             return
         await u.message.reply_text(_fmt(r), parse_mode="Markdown")
 
-    async def _debug(self, u: Update, c):
-        """Kiểm tra fetch + score cho BTC/ETH/SOL."""
-        await u.message.reply_text("🔧 Đang debug...")
-        import aiohttp, traceback
-        fetcher = self.scanner.fetcher
-        lines = []
+    async def _source(self, u: Update, c):
+        """Hiển thị API đang dùng và version."""
+        import fetcher as f_module
+        base = getattr(f_module, "BASE", "unknown")
+        await u.message.reply_text(
+            f"📡 *API Source*\n"
+            f"Base URL: `{base}`\n"
+            f"Class: `{self.scanner.fetcher.__class__.__name__}`",
+            parse_mode="Markdown"
+        )
 
-        # 1. Test raw HTTP tới Binance
+    async def _debug(self, u: Update, c):
+        """Kiểm tra kết nối OKX."""
+        await u.message.reply_text("🔧 Đang debug...")
+        import aiohttp
+        import fetcher as f_module
+        base = getattr(f_module, "BASE", "https://www.okx.com")
+        fetcher = self.scanner.fetcher
+        lines = [f"📡 API: `{base}`"]
+
+        # 1. Ping
         try:
             session = await fetcher._get_session()
             async with session.get(
-                "https://fapi.binance.com/fapi/v1/ping", timeout=aiohttp.ClientTimeout(total=10)
+                f"{base}/api/v5/public/time",
+                timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
-                lines.append(f"🌐 Binance ping: HTTP {resp.status}")
+                body = await resp.json()
+                lines.append(f"🌐 Ping: HTTP {resp.status} — {body.get('code','?')}")
         except Exception as e:
-            lines.append(f"🌐 Binance ping FAILED: {type(e).__name__}: {e}")
+            lines.append(f"🌐 Ping FAILED: {type(e).__name__}: {e}")
 
-        # 2. Test fetch OHLCV với error chi tiết
+        # 2. Fetch OHLCV
         for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
             try:
-                session = await fetcher._get_session()
-                async with session.get(
-                    "https://fapi.binance.com/fapi/v1/klines",
-                    params={"symbol": sym, "interval": "5m", "limit": 5},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    status = resp.status
-                    body = await resp.text()
-                    if status == 200:
-                        lines.append(f"✅ {sym}: HTTP 200 OK — {body[:80]}")
-                    else:
-                        lines.append(f"❌ {sym}: HTTP {status} — {body[:120]}")
+                df = await fetcher.fetch_ohlcv(sym, "5m", 5)
+                if df is not None and len(df) > 0:
+                    lines.append(f"✅ {sym}: {len(df)} bars | close={df['close'].iloc[-1]:.4f}")
+                else:
+                    lines.append(f"❌ {sym}: fetch trả về None/empty")
             except Exception as e:
-                lines.append(f"❌ {sym}: {type(e).__name__}: {str(e)[:120]}")
+                lines.append(f"❌ {sym}: {type(e).__name__}: {str(e)[:80]}")
 
         # 3. Symbol list
         syms = await fetcher.fetch_top_symbols(10)
-        lines.append(f"\n📋 Symbol list ({len(syms)} total): {syms[:5]}")
+        lines.append(f"\n📋 Symbols ({len(syms)} total): {syms[:5]}")
         lines.append(f"🎯 Min score: {self.scanner.min_score}")
 
-        await u.message.reply_text("\n".join(lines))
+        await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def _status(self, u: Update, c):
         await u.message.reply_text(
