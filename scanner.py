@@ -12,7 +12,7 @@ from signals import SignalResult, score_symbol
 logger = logging.getLogger(__name__)
 
 COOLDOWN_SECONDS = 900   # 15 phút giữa 2 alert cùng symbol
-CONCURRENCY      = 20    # số coroutines song song
+CONCURRENCY      = 50    # số coroutines song song
 
 
 class Scanner:
@@ -20,7 +20,7 @@ class Scanner:
         self,
         fetcher: BybitFetcher,
         min_score: int = 5,
-        max_symbols: int = 500,
+        max_symbols: int = 1000,
     ):
         self.fetcher      = fetcher
         self.min_score    = min_score
