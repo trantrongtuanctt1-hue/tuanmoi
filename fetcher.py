@@ -1,6 +1,6 @@
 """
-Fetcher dùng CCXT — hỗ trợ Bybit (không block Railway/US IP)
-Tự động fallback: Bybit → OKX nếu cần
+Fetcher dung CCXT - Bybit (khong bi block Railway/US IP)
+KHONG co python-binance, chi dung ccxt
 """
 
 import asyncio
@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 TIMEFRAMES = ['5m', '15m', '30m', '1h', '4h', '1d']
 CANDLE_LIMIT = {'5m': 200, '15m': 200, '30m': 150, '1h': 150, '4h': 100, '1d': 100}
-
 EXCLUDE_KEYWORDS = {'USDC','BUSD','TUSD','DAI','FDUSD','USDP','UP','DOWN','BEAR','BULL'}
 
 
@@ -29,14 +28,13 @@ def _to_df(ohlcv: list) -> pd.DataFrame:
 class BybitFetcher:
     def __init__(self, api_key='', api_secret=''):
         self.exchange = ccxt.bybit({
-            'apiKey':    api_key,
-            'secret':    api_secret,
+            'apiKey': api_key,
+            'secret': api_secret,
             'enableRateLimit': True,
-            'options': {'defaultType': 'linear'},   # USDT perpetual
+            'options': {'defaultType': 'linear'},
         })
 
     async def connect(self):
-        # CCXT lazy-connects — just load markets to verify connectivity
         await self.exchange.load_markets()
         logger.info("Bybit connected OK")
 
@@ -44,7 +42,6 @@ class BybitFetcher:
         await self.exchange.close()
 
     async def fetch_ohlcv(self, symbol: str, tf: str) -> Optional[pd.DataFrame]:
-        # Bybit symbol format: BTCUSDT → BTC/USDT:USDT  (linear perp)
         bybit_sym = symbol.replace('USDT', '/USDT:USDT')
         try:
             raw = await self.exchange.fetch_ohlcv(
@@ -70,7 +67,6 @@ class BybitFetcher:
         tickers = await self.exchange.fetch_tickers()
         filtered = []
         for sym, t in tickers.items():
-            # Only linear perp: BTC/USDT:USDT
             if not sym.endswith(f'/{quote}:{quote}'):
                 continue
             base = sym.split('/')[0]
@@ -81,13 +77,11 @@ class BybitFetcher:
                 price = float(t.get('last') or 0)
                 pct   = float(t.get('percentage') or 0)
                 if vol >= min_volume_usd and price > 0:
-                    # Convert back to Binance-style symbol for display
                     display = base + quote
                     filtered.append({'symbol': display, 'bybit_sym': sym,
                                      'volume': vol, 'price': price, 'change': pct})
             except (TypeError, ValueError):
                 continue
-
         filtered.sort(key=lambda x: x['volume'], reverse=True)
         return filtered[:max_symbols]
 
