@@ -24,9 +24,9 @@ def main():
     chat_ids   = os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
     min_score  = int(os.environ.get("MIN_ALERT_SCORE", "7"))
     scan_mins  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "5"))
-    max_tokens = int(os.environ.get("MAX_TOKENS", "500"))
+    max_tokens = int(os.environ.get("MAX_TOKENS", "1000"))
 
-    logger.info("Starting 15M ULTRA Signal Bot (Bybit, %d tokens)…", max_tokens)
+    logger.info("Starting 15M ULTRA Signal Bot (OKX, %d tokens)…", max_tokens)
 
     fetcher = BybitFetcher()
     scanner = Scanner(fetcher, min_score=min_score, max_symbols=max_tokens)
