@@ -1,6 +1,6 @@
 """
-Binance Futures REST fetcher — thay thế Bybit
-Endpoint public, không cần API key.
+OKX REST fetcher — thay thế Binance/Bybit
+Endpoint public, không cần API key, không bị geo-block.
 """
 import logging
 from typing import Optional
@@ -9,7 +9,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-BASE = "https://fapi.binance.com"
+BASE = "https://www.okx.com"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -37,80 +37,108 @@ class BybitFetcher:  # Giữ tên class để không cần sửa file khác
         timeframe: str = "5m",
         limit: int = 200,
     ) -> Optional[pd.DataFrame]:
-        """Fetch OHLCV từ Binance Futures REST."""
+        """
+        Fetch OHLCV từ OKX REST.
+        OKX symbol format: BTC-USDT-SWAP (perpetual futures)
+        Chuyển BTCUSDT → BTC-USDT-SWAP
+        """
+        # Convert BTCUSDT → BTC-USDT-SWAP
+        if symbol.endswith("USDT") and "-" not in symbol:
+            base = symbol[:-4]  # bỏ USDT
+            inst_id = f"{base}-USDT-SWAP"
+        else:
+            inst_id = symbol
+
         interval_map = {
             "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
-            "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1d", "1w": "1w",
+            "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1D", "1w": "1W",
         }
-        interval = interval_map.get(timeframe, "5m")
-        url = f"{BASE}/fapi/v1/klines"
+        bar = interval_map.get(timeframe, "5m")
+        url = f"{BASE}/api/v5/market/candles"
         params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
+            "instId": inst_id,
+            "bar": bar,
+            "limit": str(limit),
         }
         try:
             session = await self._get_session()
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
-                    logger.debug(f"{symbol} {timeframe}: HTTP {resp.status}")
+                    logger.debug(f"{inst_id} {timeframe}: HTTP {resp.status}")
                     return None
-                rows = await resp.json()
+                data = await resp.json()
+            if data.get("code") != "0":
+                logger.debug(f"{inst_id}: {data.get('msg')}")
+                return None
+            rows = data.get("data", [])
             if not rows:
                 return None
-            # Binance: [openTime, open, high, low, close, volume, ...]
-            df = pd.DataFrame(rows, columns=[
-                "timestamp", "open", "high", "low", "close", "volume",
-                "close_time", "quote_vol", "trades", "taker_base", "taker_quote", "ignore"
-            ])
-            df = df[["timestamp", "open", "high", "low", "close", "volume"]].astype(float)
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            # OKX: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+            # Newest first → reverse
+            rows = list(reversed(rows))
+            df = pd.DataFrame(rows)
+            df = df.iloc[:, :6].copy()
+            df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+            df = df.astype(float)
+            df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="ms")
             df.set_index("timestamp", inplace=True)
             return df
         except Exception as e:
-            logger.debug(f"fetch_ohlcv {symbol} {timeframe}: {e}")
+            logger.debug(f"fetch_ohlcv {inst_id} {timeframe}: {e}")
             return None
 
     async def fetch_top_symbols(self, limit: int = 500) -> list[str]:
-        """Lấy top symbols theo volume 24h từ Binance Futures."""
-        url = f"{BASE}/fapi/v1/ticker/24hr"
+        """
+        Lấy top USDT perpetual symbols theo volume 24h từ OKX.
+        Trả về dạng BTCUSDT (giữ format cũ để scanner không cần sửa).
+        """
+        url = f"{BASE}/api/v5/market/tickers"
+        params = {"instType": "SWAP"}
         try:
             session = await self._get_session()
-            async with session.get(url) as resp:
+            async with session.get(url, params=params) as resp:
                 if resp.status != 200:
                     logger.warning(f"fetch_top_symbols HTTP {resp.status}, dùng fallback")
                     return _FALLBACK[:limit]
                 data = await resp.json()
+            if data.get("code") != "0":
+                logger.warning(f"fetch_top_symbols OKX error: {data.get('msg')}")
+                return _FALLBACK[:limit]
 
-            # Chỉ lấy USDT pairs, lọc stablecoin
-            STABLES = {"BUSDUSDT", "USDCUSDT", "TUSDUSDT", "USDTUSDT", "DAIUSDT", "FDUSDUSDT"}
+            items = data.get("data", [])
+            # Chỉ lấy USDT-SWAP, filter stablecoin
+            STABLES = {"BUSD", "USDC", "TUSD", "DAI", "FDUSD"}
             usdt = [
-                x for x in data
-                if x["symbol"].endswith("USDT")
-                and x["symbol"] not in STABLES
-                and float(x.get("quoteVolume", 0)) > 0
+                x for x in items
+                if x["instId"].endswith("-USDT-SWAP")
+                and x["instId"].split("-")[0] not in STABLES
+                and float(x.get("volCcy24h", 0)) > 0
             ]
-            usdt.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-            syms = [x["symbol"] for x in usdt[:limit]]
-            logger.info(f"Fetched {len(syms)} symbols từ Binance Futures")
+            usdt.sort(key=lambda x: float(x.get("volCcy24h", 0)), reverse=True)
+
+            # Convert BTC-USDT-SWAP → BTCUSDT
+            syms = []
+            for x in usdt[:limit]:
+                base = x["instId"].split("-")[0]
+                syms.append(f"{base}USDT")
+
+            logger.info(f"Fetched {len(syms)} symbols từ OKX")
             return syms if syms else _FALLBACK[:limit]
         except Exception as e:
             logger.warning(f"fetch_top_symbols error: {e} — dùng fallback list")
             return _FALLBACK[:limit]
 
 
-# Fallback nếu API ticker cũng lỗi
+# Fallback nếu OKX ticker cũng lỗi
 _FALLBACK = [
     "BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT",
-    "AVAXUSDT","DOTUSDT","LINKUSDT","TRXUSDT","MATICUSDT","LTCUSDT","BCHUSDT",
-    "UNIUSDT","ATOMUSDT","ETCUSDT","XLMUSDT","NEARUSDT","ALGOUSDT","FILUSDT",
-    "APTUSDT","ARBUSDT","OPUSDT","INJUSDT","SUIUSDT","SEIUSDT","TIAUSDT",
-    "WIFUSDT","JUPUSDT","BONKUSDT","PEPEUSDT","FLOKIUSDT","ORDIUSDT","WLDUSDT",
-    "FETUSDT","RENDERUSDT","GRTUSDT","AAVEUSDT","MKRUSDT","CRVUSDT","LDOUSDT",
-    "RUNEUSDT","SANDUSDT","MANAUSDT","AXSUSDT","GALAUSDT","IMXUSDT","HBARUSDT",
-    "CHZUSDT","ENSUSDT","KASPAUSDT","TONUSDT","NOTUSDT","POPCATUSDT","EIGENUSDT",
-    "STRKUSDT","MUUSDT","MOVEUSDT","NEIROUSDT","GOATUSDT","MOODENGUSDT","PNUTUSDT",
-    "1000PEPEUSDT","1000BONKUSDT","BOMEUSDT","DOGSUSDT","CATIUSDT","HMSTRUSDT",
-    "SNXUSDT","DYDXUSDT","GMXUSDT","APEUSDT","FLOWUSDT","EGLDUSDT","FTMUSDT",
-    "COMPUSDT","SUSHIUSDT","OCEANUSDT","AGIXUSDT","ALTUSDT","PYTHUSDT","BERAUSDT",
+    "AVAXUSDT","DOTUSDT","LINKUSDT","TRXUSDT","LTCUSDT","BCHUSDT","UNIUSDT",
+    "ATOMUSDT","ETCUSDT","XLMUSDT","NEARUSDT","APTUSDT","ARBUSDT","OPUSDT",
+    "INJUSDT","SUIUSDT","WIFUSDT","BONKUSDT","PEPEUSDT","ORDIUSDT","WLDUSDT",
+    "FETUSDT","RENDERUSDT","GRTUSDT","AAVEUSDT","MKRUSDT","LDOUSDT","RUNEUSDT",
+    "SANDUSDT","MANAUSDT","AXSUSDT","GALAUSDT","IMXUSDT","HBARUSDT","CHZUSDT",
+    "KASPAUSDT","TONUSDT","NOTUSDT","EIGENUSDT","STRKUSDT","MUUSDT","MOVEUSDT",
+    "NEIROUSDT","GOATUSDT","MOODENGUSDT","PNUTUSDT","1000PEPEUSDT","BOMEUSDT",
+    "DOGSUSDT","CATIUSDT","SNXUSDT","DYDXUSDT","GMXUSDT","APEUSDT","FTMUSDT",
+    "COMPUSDT","SUSHIUSDT","AGIXUSDT","PYTHUSDT","BERAUSDT","JUPUSDT","TIAUSDT",
 ]
