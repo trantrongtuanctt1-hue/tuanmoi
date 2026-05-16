@@ -1,6 +1,22 @@
 [build]
-builder       = "DOCKERFILE"
+builder        = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
-
+ 
 [deploy]
 restartPolicyType = "ON_FAILURE"
+region            = "asia-southeast1"
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
