@@ -28,16 +28,21 @@ def main():
 
     logger.info("Starting 15M ULTRA Signal Bot (OKX, %d tokens, ultra≥%d)…", max_tokens, min_score)
 
-    fetcher = BybitFetcher()
-    scanner = Scanner(fetcher, min_score=min_score, max_symbols=max_tokens)
-    bot     = TelegramBot(token, scanner)
+    # Fetcher/Scanner cho bot Telegram (chạy trong main event loop)
+    fetcher_bot = BybitFetcher()
+    scanner_bot = Scanner(fetcher_bot, min_score=min_score, max_symbols=max_tokens)
+    bot         = TelegramBot(token, scanner_bot)
+
+    # Fetcher/Scanner riêng cho background auto-scan (loop khác)
+    fetcher_bg  = BybitFetcher()
+    scanner_bg  = Scanner(fetcher_bg, min_score=min_score, max_symbols=max_tokens)
 
     # Background auto-scan task — dùng scan_for_alert (có cooldown 15 phút)
     async def auto_scan():
         while True:
             await asyncio.sleep(scan_mins * 60)
             try:
-                signals = await scanner.scan_for_alert()   # ← cooldown áp ở đây
+                signals = await scanner_bg.scan_for_alert()
                 for r in signals:
                     for cid in chat_ids:
                         cid = cid.strip()
