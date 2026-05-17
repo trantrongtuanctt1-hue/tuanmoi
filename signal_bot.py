@@ -230,33 +230,55 @@ class TelegramBot:
         signals = await self.scanner.scan_all()
         if not signals:
             await u.message.reply_text(
-                "❌ Không có tín hiệu đủ mạnh lúc này.\n"
+                "❌ Không có tín hiệu ultra≥8 lúc này.\n"
                 "Dùng /debug để kiểm tra kết nối."
             )
             return
-        for r in signals[:10]:
-            await u.message.reply_text(_fmt(r), parse_mode="Markdown")
-        spikes   = [r for r in signals if r.is_spike]
-        premiums = [r for r in signals if r.is_premium]
+
         strong   = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score) >= 9]
-        summary = (
-            f"✅ *Xong!* Tổng: {len(signals)} tín hiệu\n"
+        mid      = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score) == 8]
+        premiums = [r for r in signals if r.is_premium]
+        spikes   = [r for r in signals if r.is_spike]
+
+        # Gửi summary trước
+        await u.message.reply_text(
+            f"📊 *Kết quả scan* — {len(signals)} tín hiệu (ultra≥8)\n"
             f"🚀 STRONG (ULTRA≥9): {len(strong)}\n"
-            f"⭐ Premium SXL: {len(premiums)}\n"
-            f"⚡ Spike alerts: {len(spikes)}"
+            f"✅ BUY/SELL (ULTRA=8): {len(mid)}\n"
+            f"⭐ Premium: {len(premiums)}  ⚡ Spike: {len(spikes)}\n"
+            f"_(Gửi từng signal bên dưới…)_",
+            parse_mode="Markdown"
         )
-        await u.message.reply_text(summary, parse_mode="Markdown")
+
+        # Gửi TẤT CẢ signal — full format, không giới hạn số lượng
+        for r in signals:
+            await u.message.reply_text(_fmt(r), parse_mode="Markdown")
+
+        await u.message.reply_text(
+            f"✅ *Xong!* Đã gửi {len(signals)} tín hiệu.",
+            parse_mode="Markdown"
+        )
 
     async def _top(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text("🔍 Đang lấy top tín hiệu...")
+        await u.message.reply_text("🔍 Đang lấy top tín hiệu (ultra≥8)...")
         signals = await self.scanner.scan_all()
         if not signals:
             await u.message.reply_text("❌ Không có tín hiệu. Dùng /debug kiểm tra.")
             return
-        lines = ["🏆 *Top 5 Tín Hiệu Mạnh Nhất*\n"]
-        for i, r in enumerate(signals[:5], 1):
-            lines.append(f"*#{i}* {_fmt_short(r)}\n")
-        await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines = [f"🏆 *Top Tín Hiệu (ultra≥8)* — {len(signals)} token\n"]
+        for i, r in enumerate(signals, 1):
+            badge = "🚀" if max(r.ultra_buy_score, r.ultra_sell_score) >= 9 else "✅"
+            lines.append(f"*#{i}* {badge} {_fmt_short(r)}\n")
+        # Chia nhỏ nếu quá 4096 ký tự
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) > 3800:
+                await u.message.reply_text(chunk, parse_mode="Markdown")
+                chunk = line
+            else:
+                chunk += line
+        if chunk:
+            await u.message.reply_text(chunk, parse_mode="Markdown")
 
     async def _check(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         args = c.args
