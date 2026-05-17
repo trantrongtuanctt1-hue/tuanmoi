@@ -91,11 +91,23 @@ class SignalResult:
     mtf_context_bull:  bool = False   # 1h+4h+1d đồng thời ≥3/4 bull
     mtf_context_bear:  bool = False
 
-    # ── ULTRA Score ────────────────────────────────────────────────────────
+    # ── ULTRA Score (15m) ──────────────────────────────────────────────────
     ultra_buy_score:  int = 0    # 0-11
     ultra_sell_score: int = 0
     ultra_verdict:    str = "⏳ NEUTRAL"
     ultra_verdict_color: str = "gray"   # "green" | "red" | "gray"
+
+    # ── ULTRA Score 1h ─────────────────────────────────────────────────────
+    ultra_1h_buy:     int = 0
+    ultra_1h_sell:    int = 0
+    ultra_1h_verdict: str = "⏳ NEUTRAL"
+    ultra_1h_color:   str = "gray"
+
+    # ── ULTRA Score 4h ─────────────────────────────────────────────────────
+    ultra_4h_buy:     int = 0
+    ultra_4h_sell:    int = 0
+    ultra_4h_verdict: str = "⏳ NEUTRAL"
+    ultra_4h_color:   str = "gray"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -628,6 +640,140 @@ def _ultra_verdict(buy: int, sell: int) -> tuple[str, str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# ULTRA SCORE FOR ANY TF  (tách từ score_symbol để tái dùng cho 1h / 4h)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _ultra_score_for_tf(
+    df_cur:  Optional[pd.DataFrame],   # TF đang tính (15m / 1h / 4h …)
+    df_5m:   Optional[pd.DataFrame],
+    df_15m:  Optional[pd.DataFrame],
+    df_30m:  Optional[pd.DataFrame],
+    df_1h:   Optional[pd.DataFrame],
+    df_4h:   Optional[pd.DataFrame],
+    df_1d:   Optional[pd.DataFrame],
+    rsi_len:       int   = 14,
+    rsi_lookback:  int   = 3,
+    rsi_threshold: float = 1.5,
+) -> dict:
+    """
+    Tính ULTRA score (0-11) cho TF bất kỳ — logic giống 15M ULTRA engine.
+
+    Trả dict:
+      buy, sell           : int  0-11
+      verdict, color      : str
+      st_ai_bull          : bool
+      st_ai_factor        : float
+      ut_pos_val          : int   1 / -1 / 0
+      sar_bull_val        : bool
+      smc_swing_v         : int   1 / -1
+      smc_int_v           : int   1 / -1  (luôn dùng df_5m)
+      zone, zone_pct      : str, int
+      rsi_bull, rsi_bear  : int  (count trên 6 TF)
+      mtf_ctx_bull/bear   : bool
+    """
+    _empty = {
+        "buy": 0, "sell": 0, "verdict": "⏳ NEUTRAL", "color": "gray",
+        "st_ai_bull": False, "st_ai_factor": 3.0,
+        "ut_pos_val": 0, "sar_bull_val": False,
+        "smc_swing_v": 0, "smc_int_v": 0,
+        "zone": "EQ", "zone_pct": 50,
+        "rsi_bull": 0, "rsi_bear": 0,
+        "mtf_ctx_bull": False, "mtf_ctx_bear": False,
+    }
+    if df_cur is None or len(df_cur) < 20:
+        return _empty
+    if df_5m is None or len(df_5m) < 20:
+        return _empty
+
+    # ── Base indicators (trên df_cur) ──────────────────────────────────────
+    st_ai_is_bull, st_ai_factor = supertrend_ai(df_cur)
+    ut_pos_val, _               = ut_bot(df_cur)
+    sar_bull_val, _             = parabolic_sar(df_cur)
+
+    msb_cur     = msb_bias(df_cur)
+    smc_swing_v = 1 if msb_cur["market_bias"] == "BULL" else -1
+
+    msb_5m      = msb_bias(df_5m)
+    smc_int_v   = 1 if msb_5m["market_bias"] == "BULL" else -1
+
+    zone_name, zone_pct = zone_classify(df_cur)
+    not_premium  = zone_name != "PREM"
+    not_discount = zone_name != "DISC"
+
+    # ── RSI MTF (6 TF: 5m 15m 30m 1h 4h 1d) ────────────────────────────
+    rsi_dirs = [
+        rsi_direction(df_5m,  rsi_len, rsi_lookback, rsi_threshold),
+        rsi_direction(df_15m, rsi_len, rsi_lookback, rsi_threshold),
+        rsi_direction(df_30m, rsi_len, rsi_lookback, rsi_threshold),
+        rsi_direction(df_1h,  rsi_len, rsi_lookback, rsi_threshold),
+        rsi_direction(df_4h,  rsi_len, rsi_lookback, rsi_threshold),
+        rsi_direction(df_1d,  rsi_len, rsi_lookback, rsi_threshold),
+    ]
+    rsi_bull_count = sum(1 for d in rsi_dirs if d ==  1)
+    rsi_bear_count = sum(1 for d in rsi_dirs if d == -1)
+
+    # ── MTF 3 tầng (giống 15m: Momentum 5m / Bridge 30m / Context 1h+4h+1d)
+    ind_5m  = _tf_ind(df_5m)
+    ind_30m = _tf_ind(df_30m)
+    ind_1h  = _tf_ind(df_1h)
+    ind_4h  = _tf_ind(df_4h)
+    ind_1d  = _tf_ind(df_1d)
+
+    mtf_momentum_bull = _tf_bull_cnt(ind_5m)  >= 3
+    mtf_momentum_bear = _tf_bear_cnt(ind_5m)  >= 3
+    mtf_bridge_bull   = _tf_bull_cnt(ind_30m) >= 3
+    mtf_bridge_bear   = _tf_bear_cnt(ind_30m) >= 3
+    mtf_context_bull  = (_tf_bull_cnt(ind_1h) >= 3 and
+                         _tf_bull_cnt(ind_4h) >= 3 and
+                         _tf_bull_cnt(ind_1d) >= 3)
+    mtf_context_bear  = (_tf_bear_cnt(ind_1h) >= 3 and
+                         _tf_bear_cnt(ind_4h) >= 3 and
+                         _tf_bear_cnt(ind_1d) >= 3)
+
+    # ── ULTRA Score (0-11) ───────────────────────────────────────────────
+    buy_base  = sum([st_ai_is_bull, ut_pos_val == 1,  sar_bull_val,
+                     smc_swing_v == 1,  smc_int_v == 1,  not_premium])
+    sell_base = sum([not st_ai_is_bull, ut_pos_val == -1, not sar_bull_val,
+                     smc_swing_v == -1, smc_int_v == -1, not_discount])
+
+    ultra_buy  = min(11, max(0,
+        buy_base
+        + (2 if mtf_context_bull  else 0)
+        + (1 if mtf_bridge_bull   else 0)
+        + (1 if mtf_momentum_bull else 0)
+        + (1 if rsi_bull_count >= 4 else 0)
+    ))
+    ultra_sell = min(11, max(0,
+        sell_base
+        + (2 if mtf_context_bear  else 0)
+        + (1 if mtf_bridge_bear   else 0)
+        + (1 if mtf_momentum_bear else 0)
+        + (1 if rsi_bear_count >= 4 else 0)
+    ))
+
+    verdict, color = _ultra_verdict(ultra_buy, ultra_sell)
+
+    return {
+        "buy":            ultra_buy,
+        "sell":           ultra_sell,
+        "verdict":        verdict,
+        "color":          color,
+        "st_ai_bull":     st_ai_is_bull,
+        "st_ai_factor":   st_ai_factor,
+        "ut_pos_val":     ut_pos_val,
+        "sar_bull_val":   sar_bull_val,
+        "smc_swing_v":    smc_swing_v,
+        "smc_int_v":      smc_int_v,
+        "zone":           zone_name,
+        "zone_pct":       zone_pct,
+        "rsi_bull":       rsi_bull_count,
+        "rsi_bear":       rsi_bear_count,
+        "mtf_ctx_bull":   mtf_context_bull,
+        "mtf_ctx_bear":   mtf_context_bear,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # MAIN SCORER  (v3.0 — kết hợp SXL + 15M ULTRA)
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -750,108 +896,62 @@ def score_symbol(
             reasons.append(f"⚡Spike{spk['spike_direction']}{spk['spike_pct']}%")
 
     # ══════════════════════════════════════════════════════════════════════
-    # PHẦN B: 15M ULTRA ENGINE  (port từ PineScript)
+    # PHẦN B: ULTRA ENGINE  (15m + 1h + 4h)
     # ══════════════════════════════════════════════════════════════════════
 
-    # B1. SuperTrend AI trên 15m
-    st_ai_is_bull, st_ai_factor = supertrend_ai(df_cur)
+    _tf_args = (df_5m, df_15m, df_30m, df_1h, df_4h, df_1d,
+                rsi_len, rsi_lookback, rsi_threshold)
 
-    # B2. UT Bot trên 15m
-    ut_pos_val, _ut_trail = ut_bot(df_cur)
+    # B-15m: ULTRA score trên khung 15m (giống v3.0 cũ)
+    u15 = _ultra_score_for_tf(df_cur, *_tf_args)
 
-    # B3. Parabolic SAR trên 15m
-    sar_bull_val, _sar_val = parabolic_sar(df_cur)
+    # B-1h: ULTRA score trên khung 1h
+    u1h = _ultra_score_for_tf(df_1h, *_tf_args)
 
-    # B4. SMC Swing (MSB) trên 15m
-    msb_cur      = msb_bias(df_cur)
-    smc_swing_v  = 1 if msb_cur["market_bias"] == "BULL" else -1
+    # B-4h: ULTRA score trên khung 4h
+    u4h = _ultra_score_for_tf(df_4h, *_tf_args)
 
-    # B5. SMC Internal (MSB trên 5m = shorter swing)
-    msb_5m      = msb_bias(df_5m)
-    smc_int_v   = 1 if msb_5m["market_bias"] == "BULL" else -1
+    # Alias 15m fields (giữ tên cũ để không đổi code phía dưới)
+    st_ai_is_bull   = u15["st_ai_bull"]
+    st_ai_factor    = u15["st_ai_factor"]
+    ut_pos_val      = u15["ut_pos_val"]
+    sar_bull_val    = u15["sar_bull_val"]
+    smc_swing_v     = u15["smc_swing_v"]
+    smc_int_v       = u15["smc_int_v"]
+    zone_name       = u15["zone"]
+    zone_pct        = u15["zone_pct"]
+    rsi_bull_count  = u15["rsi_bull"]
+    rsi_bear_count  = u15["rsi_bear"]
+    mtf_momentum_bull = _tf_bull_cnt(_tf_ind(df_5m))  >= 3
+    mtf_momentum_bear = _tf_bear_cnt(_tf_ind(df_5m))  >= 3
+    mtf_bridge_bull   = _tf_bull_cnt(_tf_ind(df_30m)) >= 3
+    mtf_bridge_bear   = _tf_bear_cnt(_tf_ind(df_30m)) >= 3
+    mtf_context_bull  = u15["mtf_ctx_bull"]
+    mtf_context_bear  = u15["mtf_ctx_bear"]
 
-    # B6. Zone (trên 15m)
-    zone_name, zone_pct = zone_classify(df_cur)
-    not_premium  = zone_name != "PREM"   # không vào lệnh LONG trong vùng premium
-    not_discount = zone_name != "DISC"   # không vào lệnh SHORT trong vùng discount
+    ultra_buy    = u15["buy"]
+    ultra_sell   = u15["sell"]
+    verdict      = u15["verdict"]
+    verdict_color = u15["color"]
 
-    # B7. RSI MTF (6 TF: 5m, 15m, 30m, 1h, 4h, 1d)
-    rsi_dirs = [
-        rsi_direction(df_5m,  rsi_len, rsi_lookback, rsi_threshold),
-        rsi_direction(df_15m, rsi_len, rsi_lookback, rsi_threshold),
-        rsi_direction(df_30m, rsi_len, rsi_lookback, rsi_threshold),
-        rsi_direction(df_1h,  rsi_len, rsi_lookback, rsi_threshold),
-        rsi_direction(df_4h,  rsi_len, rsi_lookback, rsi_threshold),
-        rsi_direction(df_1d,  rsi_len, rsi_lookback, rsi_threshold),
-    ]
-    rsi_bull_count = sum(1 for d in rsi_dirs if d ==  1)
-    rsi_bear_count = sum(1 for d in rsi_dirs if d == -1)
+    # Tổng hợp điểm cao nhất qua cả 3 TF (dùng cho direction + tags)
+    best_buy  = max(ultra_buy,  u1h["buy"],  u4h["buy"])
+    best_sell = max(ultra_sell, u1h["sell"], u4h["sell"])
 
-    # B8. MTF indicators (simple ST + UT + SAR + SMC) cho mỗi TF
-    ind_5m  = _tf_ind(df_5m)
-    ind_30m = _tf_ind(df_30m)
-    ind_1h  = _tf_ind(df_1h)
-    ind_4h  = _tf_ind(df_4h)
-    ind_1d  = _tf_ind(df_1d)
-
-    bull_5m  = _tf_bull_cnt(ind_5m)
-    bear_5m  = _tf_bear_cnt(ind_5m)
-    bull_30m = _tf_bull_cnt(ind_30m)
-    bear_30m = _tf_bear_cnt(ind_30m)
-    bull_1h  = _tf_bull_cnt(ind_1h)
-    bear_1h  = _tf_bear_cnt(ind_1h)
-    bull_4h  = _tf_bull_cnt(ind_4h)
-    bear_4h  = _tf_bear_cnt(ind_4h)
-    bull_1d  = _tf_bull_cnt(ind_1d)
-    bear_1d  = _tf_bear_cnt(ind_1d)
-
-    mtf_momentum_bull = bull_5m  >= 3
-    mtf_momentum_bear = bear_5m  >= 3
-    mtf_bridge_bull   = bull_30m >= 3
-    mtf_bridge_bear   = bear_30m >= 3
-    mtf_context_bull  = bull_1h  >= 3 and bull_4h >= 3 and bull_1d >= 3
-    mtf_context_bear  = bear_1h  >= 3 and bear_4h >= 3 and bear_1d >= 3
-
-    # B9. ULTRA Score (0-11, giống PineScript Section N)
-    #   Base 15m buy (max 6): ST AI + UT + SAR + SMC Swing + SMC Internal + Zone ok
+    # Indicators 15m cũ (dùng cho check bên dưới)
     ck_st_buy  = st_ai_is_bull
     ck_ut_buy  = ut_pos_val == 1
     ck_sar_buy = sar_bull_val
-    ck_smc_sw  = smc_swing_v == 1
-    ck_smc_in  = smc_int_v   == 1
-    ck_zone_b  = not_premium  # không trong vùng premium → ok để mua
-
     ck_st_sell  = not st_ai_is_bull
     ck_ut_sell  = ut_pos_val == -1
     ck_sar_sell = not sar_bull_val
-    ck_smc_sw_s = smc_swing_v == -1
-    ck_smc_in_s = smc_int_v   == -1
-    ck_zone_s   = not_discount
-
-    buy_score_base  = sum([ck_st_buy, ck_ut_buy, ck_sar_buy, ck_smc_sw, ck_smc_in, ck_zone_b])
-    sell_score_base = sum([ck_st_sell, ck_ut_sell, ck_sar_sell, ck_smc_sw_s, ck_smc_in_s, ck_zone_s])
-
-    ultra_buy  = (buy_score_base
-                  + (2 if mtf_context_bull  else 0)
-                  + (1 if mtf_bridge_bull   else 0)
-                  + (1 if mtf_momentum_bull else 0)
-                  + (1 if rsi_bull_count >= 4 else 0))
-    ultra_sell = (sell_score_base
-                  + (2 if mtf_context_bear  else 0)
-                  + (1 if mtf_bridge_bear   else 0)
-                  + (1 if mtf_momentum_bear else 0)
-                  + (1 if rsi_bear_count >= 4 else 0))
-
-    ultra_buy  = min(11, max(0, ultra_buy))
-    ultra_sell = min(11, max(0, ultra_sell))
-    verdict, verdict_color = _ultra_verdict(ultra_buy, ultra_sell)
 
     # ══════════════════════════════════════════════════════════════════════
-    # PHẦN C: DIRECTION & SL/TP (ưu tiên ULTRA score)
+    # PHẦN C: DIRECTION & SL/TP (ưu tiên điểm cao nhất trong 15m/1h/4h)
     # ══════════════════════════════════════════════════════════════════════
-    if ultra_buy >= 5 and ultra_buy >= ultra_sell:
+    if best_buy >= 5 and best_buy >= best_sell:
         direction = "LONG"
-    elif ultra_sell >= 5 and ultra_sell > ultra_buy:
+    elif best_sell >= 5 and best_sell > best_buy:
         direction = "SHORT"
     elif l_sig and l_sc >= s_sc:
         direction = "LONG"
@@ -884,7 +984,7 @@ def score_symbol(
     )
     vol_confirm = (direction == "LONG" and vol_long) or (direction == "SHORT" and vol_short)
 
-    # Thêm ULTRA tags vào reasons
+    # Thêm ULTRA tags vào reasons (15m)
     ultra_tags = []
     if ck_st_buy or ck_st_sell:
         ultra_tags.append(f"ST-AI({'▲' if st_ai_is_bull else '▼'} F{st_ai_factor:.1f})")
@@ -894,8 +994,17 @@ def score_symbol(
         ultra_tags.append(f"SAR({'▲' if sar_bull_val else '▼'})")
     if mtf_context_bull or mtf_context_bear:
         ultra_tags.append("CTX✓")
+    # Thêm tag nếu 1h hoặc 4h có STRONG BUY/SELL
+    if u1h["buy"] >= 9:
+        ultra_tags.append("1H🚀SB")
+    elif u1h["sell"] >= 9:
+        ultra_tags.append("1H🔻SS")
+    if u4h["buy"] >= 9:
+        ultra_tags.append("4H🚀SB")
+    elif u4h["sell"] >= 9:
+        ultra_tags.append("4H🔻SS")
     if ultra_tags:
-        reasons += ultra_tags[:3]
+        reasons += ultra_tags[:4]
 
     return SignalResult(
         symbol      = symbol,
@@ -942,4 +1051,14 @@ def score_symbol(
         ultra_sell_score  = ultra_sell,
         ultra_verdict     = verdict,
         ultra_verdict_color = verdict_color,
+        # ULTRA 1h
+        ultra_1h_buy      = u1h["buy"],
+        ultra_1h_sell     = u1h["sell"],
+        ultra_1h_verdict  = u1h["verdict"],
+        ultra_1h_color    = u1h["color"],
+        # ULTRA 4h
+        ultra_4h_buy      = u4h["buy"],
+        ultra_4h_sell     = u4h["sell"],
+        ultra_4h_verdict  = u4h["verdict"],
+        ultra_4h_color    = u4h["color"],
     )
