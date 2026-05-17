@@ -1,6 +1,10 @@
 """
-Scanner — quét tối đa 500 token song song, cooldown chống spam
-v3.0: fetch 6 TF (5m, 15m, 30m, 1h, 4h, 1d) cho ULTRA scoring
+Scanner — quét tối đa 500 token song song
+v3.2:
+  - Ngưỡng pass: ultra_buy hoặc ultra_sell >= 8
+  - scan_all()       → trả TẤT CẢ đủ điều kiện, KHÔNG áp cooldown (dùng cho /scan manual)
+  - scan_for_alert() → áp cooldown 15 phút (dùng cho auto alert 5 phút)
+  - scan_symbol()    → quét 1 token, không cooldown, không ngưỡng
 """
 import asyncio
 import logging
@@ -12,15 +16,15 @@ from signals import SignalResult, score_symbol
 
 logger = logging.getLogger(__name__)
 
-COOLDOWN_SECONDS = 900   # 15 phút giữa 2 alert cùng symbol
-CONCURRENCY      = 30    # giảm từ 50 → 30 vì mỗi symbol giờ fetch 6 TF
+COOLDOWN_SECONDS = 900   # 15 phút, chỉ dùng cho auto alert
+CONCURRENCY      = 30
 
 
 class Scanner:
     def __init__(
         self,
         fetcher: BybitFetcher,
-        min_score: int = 5,
+        min_score: int = 8,       # ultra score threshold, đọc từ env MIN_ALERT_SCORE
         max_symbols: int = 1000,
     ):
         self.fetcher      = fetcher
@@ -35,9 +39,9 @@ class Scanner:
     def _mark_alert(self, symbol: str):
         self._last_alert[symbol] = time.time()
 
-    async def _analyse_one(self, symbol: str) -> Optional[SignalResult]:
+    async def _analyse_one(self, symbol: str, ignore_threshold: bool = False) -> Optional[SignalResult]:
+        """Fetch 6 TF và score. ignore_threshold=True để luôn trả kết quả (dùng cho /check)."""
         try:
-            # Fetch 6 timeframes đồng thời
             df5, df15, df30, df1h, df4h, df1d = await asyncio.gather(
                 self.fetcher.fetch_ohlcv(symbol, "5m",  100),
                 self.fetcher.fetch_ohlcv(symbol, "15m",  60),
@@ -47,11 +51,8 @@ class Scanner:
                 self.fetcher.fetch_ohlcv(symbol, "1d",   60),
             )
 
-            # Bắt buộc có 5m (để SXL engine chạy)
             if df5 is None or len(df5) < 50:
                 return None
-
-            # 15m fallback về 5m nếu fetch lỗi
             if df15 is None or len(df15) < 20:
                 df15 = df5
 
@@ -65,25 +66,22 @@ class Scanner:
                 df_1d  = df1d,
             )
 
-            # Threshold: dùng ultra_buy/sell score làm tiêu chí chính
-            # Nếu ultra score ≥5 HOẶC sxl score ≥ min_score → giữ
-            passes = (
-                result.ultra_buy_score  >= self.min_score or
-                result.ultra_sell_score >= self.min_score or
-                result.score            >= self.min_score
-            )
-            return result if passes else None
+            if ignore_threshold:
+                return result
+
+            ultra_max = max(result.ultra_buy_score, result.ultra_sell_score)
+            return result if ultra_max >= self.min_score else None
 
         except Exception as e:
             logger.debug(f"{symbol}: {e}")
             return None
 
-    async def scan_all(self) -> list[SignalResult]:
+    async def _run_scan(self) -> list[SignalResult]:
+        """Core: quét toàn bộ symbols, trả tất cả đủ ngưỡng, sort theo score."""
         symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
-        logger.info(f"Scanning {len(symbols)} symbols (6 TF each)…")
+        logger.info(f"Scanning {len(symbols)} symbols (6 TF, ultra>={self.min_score})…")
 
-        sem     = asyncio.Semaphore(CONCURRENCY)
-        signals: list[SignalResult] = []
+        sem = asyncio.Semaphore(CONCURRENCY)
 
         async def limited(sym):
             async with sem:
@@ -91,22 +89,47 @@ class Scanner:
 
         results = await asyncio.gather(*[limited(s) for s in symbols])
 
-        for r in results:
-            if r and not self._in_cooldown(r.symbol):
-                self._mark_alert(r.symbol)
-                signals.append(r)
-
-        # Sắp xếp: ưu tiên ultra score, sau đó sxl score
+        signals = [r for r in results if r is not None]
         signals.sort(
             key=lambda x: (max(x.ultra_buy_score, x.ultra_sell_score), x.score),
             reverse=True,
         )
-        logger.info(f"Found {len(signals)} signals ≥ {self.min_score}")
+        logger.info(f"Signals found: {len(signals)}")
         return signals
 
+    async def scan_all(self) -> list[SignalResult]:
+        """
+        Dùng cho /scan manual.
+        Trả TẤT CẢ signal ultra >= ngưỡng — KHÔNG áp cooldown, KHÔNG đánh dấu cooldown.
+        """
+        signals = await self._run_scan()
+        logger.info(f"/scan → {len(signals)} signals (no cooldown filter)")
+        return signals
+
+    async def scan_for_alert(self) -> list[SignalResult]:
+        """
+        Dùng cho auto alert (background 5 phút).
+        Áp cooldown 15 phút — token đã gửi gần đây bị skip.
+        Chỉ đánh dấu cooldown cho token thực sự được gửi đi.
+        """
+        all_signals = await self._run_scan()
+
+        to_send = []
+        for r in all_signals:
+            if not self._in_cooldown(r.symbol):
+                self._mark_alert(r.symbol)
+                to_send.append(r)
+
+        skipped = len(all_signals) - len(to_send)
+        logger.info(
+            f"auto alert → gửi {len(to_send)} / skip {skipped} (cooldown) "
+            f"/ tổng {len(all_signals)}"
+        )
+        return to_send
+
     async def scan_symbol(self, symbol: str) -> Optional[SignalResult]:
-        """Quét 1 token theo yêu cầu (bỏ qua cooldown)."""
+        """Quét 1 token (/check), bỏ ngưỡng ultra, luôn trả kết quả."""
         sym = symbol.upper()
         if not sym.endswith("USDT"):
             sym += "USDT"
-        return await self._analyse_one(sym)
+        return await self._analyse_one(sym, ignore_threshold=True)
