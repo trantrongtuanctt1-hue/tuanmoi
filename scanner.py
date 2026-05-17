@@ -69,8 +69,13 @@ class Scanner:
             if ignore_threshold:
                 return result
 
-            ultra_max = max(result.ultra_buy_score, result.ultra_sell_score)
-            return result if ultra_max >= self.min_score else None
+            # Pass nếu 15m ULTRA >= ngưỡng HOẶC 1h / 4h có STRONG BUY/SELL
+            ultra_15m = max(result.ultra_buy_score, result.ultra_sell_score)
+            ultra_1h  = max(result.ultra_1h_buy,    result.ultra_1h_sell)
+            ultra_4h  = max(result.ultra_4h_buy,    result.ultra_4h_sell)
+            if ultra_15m >= self.min_score or ultra_1h >= self.min_score or ultra_4h >= self.min_score:
+                return result
+            return None
 
         except Exception as e:
             logger.debug(f"{symbol}: {e}")
@@ -91,7 +96,12 @@ class Scanner:
 
         signals = [r for r in results if r is not None]
         signals.sort(
-            key=lambda x: (max(x.ultra_buy_score, x.ultra_sell_score), x.score),
+            key=lambda x: (
+                max(x.ultra_buy_score, x.ultra_sell_score,
+                    x.ultra_1h_buy, x.ultra_1h_sell,
+                    x.ultra_4h_buy, x.ultra_4h_sell),
+                x.score,
+            ),
             reverse=True,
         )
         logger.info(f"Signals found: {len(signals)}")
