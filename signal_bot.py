@@ -94,11 +94,20 @@ def _fmt(r: SignalResult) -> str:
         r.mtf_context_bull,  r.mtf_context_bear,
     )
 
-    # ── Ultra score bar ──────────────────────────────────────────────────
+    # ── Ultra score bar (15m) ─────────────────────────────────────────────
     ultra_max    = max(r.ultra_buy_score, r.ultra_sell_score)
     ultra_bar    = "█" * ultra_max + "░" * (11 - ultra_max)
     ultra_side   = "↑" if r.ultra_buy_score >= r.ultra_sell_score else "↓"
     ultra_color  = "🟢" if r.ultra_verdict_color == "green" else ("🔴" if r.ultra_verdict_color == "red" else "⬜")
+
+    # ── Ultra 1h / 4h ────────────────────────────────────────────────────
+    def _uc(color): return "🟢" if color == "green" else ("🔴" if color == "red" else "⬜")
+    def _ubar(b, s): m = max(b, s); return "█" * m + "░" * (11 - m)
+
+    u1h_color = _uc(r.ultra_1h_color)
+    u4h_color = _uc(r.ultra_4h_color)
+    u1h_bar   = _ubar(r.ultra_1h_buy, r.ultra_1h_sell)
+    u4h_bar   = _ubar(r.ultra_4h_buy, r.ultra_4h_sell)
 
     msg = (
         f"{dir_emoji} *{r.symbol}*  [{r.direction}]  SXL: *{r.score}/10*\n"
@@ -125,10 +134,20 @@ def _fmt(r: SignalResult) -> str:
         f"🔗 *MTF 3 Tầng*\n"
         f"  {mtf_txt}\n"
         f"{'─' * 30}\n"
-        f"🏆 *ULTRA Score*\n"
+        f"🏆 *ULTRA Score (15m)*\n"
         f"  {ultra_color} BUY {r.ultra_buy_score}↑ / SELL {r.ultra_sell_score}↓ /11\n"
         f"  `{ultra_bar}` {ultra_side}\n"
         f"  Verdict: *{r.ultra_verdict}*\n"
+        f"{'─' * 30}\n"
+        f"⏱ *ULTRA Score 1H*\n"
+        f"  {u1h_color} BUY {r.ultra_1h_buy}↑ / SELL {r.ultra_1h_sell}↓ /11\n"
+        f"  `{u1h_bar}`\n"
+        f"  Verdict: *{r.ultra_1h_verdict}*\n"
+        f"{'─' * 30}\n"
+        f"⏱ *ULTRA Score 4H*\n"
+        f"  {u4h_color} BUY {r.ultra_4h_buy}↑ / SELL {r.ultra_4h_sell}↓ /11\n"
+        f"  `{u4h_bar}`\n"
+        f"  Verdict: *{r.ultra_4h_verdict}*\n"
         f"{'─' * 30}\n"
         f"{vol_icon} *Volume Balance*\n"
         f"  ▲ Bull: {r.bull_pct}%  |  ▼ Bear: {r.bear_pct}%{vol_dom}\n"
@@ -161,9 +180,15 @@ def _fmt_short(r: SignalResult) -> str:
     ut_txt = "L" if r.ut_pos_val == 1 else ("S" if r.ut_pos_val == -1 else "—")
     mtf_ctx = "✅" if (r.mtf_context_bull or r.mtf_context_bear) else "⬜"
 
+    def _uc(c): return "🟢" if c == "green" else ("🔴" if c == "red" else "⬜")
+    u1h_em = _uc(r.ultra_1h_color)
+    u4h_em = _uc(r.ultra_4h_color)
+
     return (
-        f"{dir_emoji} *{r.symbol}*{prem}  SXL:`{r.score}/10`  ULTRA:`{r.ultra_buy_score}↑{r.ultra_sell_score}↓`{spk}\n"
-        f"  {v_em} *{r.ultra_verdict}*\n"
+        f"{dir_emoji} *{r.symbol}*{prem}  SXL:`{r.score}/10`  15m:`{r.ultra_buy_score}↑{r.ultra_sell_score}↓`{spk}\n"
+        f"  {v_em} *{r.ultra_verdict}*  "
+        f"1H:{u1h_em}`{r.ultra_1h_buy}↑{r.ultra_1h_sell}↓` *{r.ultra_1h_verdict}*\n"
+        f"  4H:{u4h_em}`{r.ultra_4h_buy}↑{r.ultra_4h_sell}↓` *{r.ultra_4h_verdict}*\n"
         f"  ST-AI:{_arr(r.st_ai_bull)} UT:{ut_txt} SAR:{_arr(r.sar_bull_val)} "
         f"Zone:{zone_icon}{r.zone}({r.zone_pct}%) CTX:{mtf_ctx}\n"
         f"  RSI▲{r.rsi_bull_count}/6 ▼{r.rsi_bear_count}/6 | "
@@ -235,8 +260,12 @@ class TelegramBot:
             )
             return
 
-        strong   = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score) >= 9]
-        mid      = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score) == 8]
+        strong   = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
+                                              r.ultra_1h_buy, r.ultra_1h_sell,
+                                              r.ultra_4h_buy, r.ultra_4h_sell) >= 9]
+        mid      = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
+                                              r.ultra_1h_buy, r.ultra_1h_sell,
+                                              r.ultra_4h_buy, r.ultra_4h_sell) == 8]
         premiums = [r for r in signals if r.is_premium]
         spikes   = [r for r in signals if r.is_spike]
 
@@ -365,7 +394,9 @@ class TelegramBot:
     async def send_signal(self, chat_id: str, result: SignalResult):
         """Gửi auto alert — ưu tiên ULTRA verdict."""
         try:
-            ultra_max = max(result.ultra_buy_score, result.ultra_sell_score)
+            ultra_max = max(result.ultra_buy_score, result.ultra_sell_score,
+                        result.ultra_1h_buy,    result.ultra_1h_sell,
+                        result.ultra_4h_buy,    result.ultra_4h_sell)
             if ultra_max >= 9:
                 prefix = "🚨🚀 *AUTO ALERT — STRONG*"
             elif ultra_max >= 7:
