@@ -22,22 +22,22 @@ from signal_bot import TelegramBot
 def main():
     token      = os.environ["TELEGRAM_TOKEN"]
     chat_ids   = os.environ.get("TELEGRAM_CHAT_IDS", "").split(",")
-    min_score  = int(os.environ.get("MIN_ALERT_SCORE", "7"))
+    min_score  = int(os.environ.get("MIN_ALERT_SCORE", "8"))
     scan_mins  = int(os.environ.get("SCAN_INTERVAL_MINUTES", "5"))
     max_tokens = int(os.environ.get("MAX_TOKENS", "1000"))
 
-    logger.info("Starting 15M ULTRA Signal Bot (OKX, %d tokens)…", max_tokens)
+    logger.info("Starting 15M ULTRA Signal Bot (OKX, %d tokens, ultra≥%d)…", max_tokens, min_score)
 
     fetcher = BybitFetcher()
     scanner = Scanner(fetcher, min_score=min_score, max_symbols=max_tokens)
     bot     = TelegramBot(token, scanner)
 
-    # Background auto-scan task
+    # Background auto-scan task — dùng scan_for_alert (có cooldown 15 phút)
     async def auto_scan():
         while True:
             await asyncio.sleep(scan_mins * 60)
             try:
-                signals = await scanner.scan_all()
+                signals = await scanner.scan_for_alert()   # ← cooldown áp ở đây
                 for r in signals:
                     for cid in chat_ids:
                         cid = cid.strip()
