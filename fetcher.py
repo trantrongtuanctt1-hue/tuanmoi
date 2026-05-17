@@ -29,9 +29,19 @@ class BybitFetcher:  # Giữ tên class để không cần sửa file khác
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)  # tăng timeout cho 500 token
+        current_loop = asyncio.get_running_loop()
+        # Tạo session mới nếu chưa có, đã đóng, hoặc thuộc về event loop khác
+        if (self._session is None
+                or self._session.closed
+                or getattr(self, "_session_loop", None) is not current_loop):
+            if self._session and not self._session.closed:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
             self._session = aiohttp.ClientSession(timeout=timeout, headers=HEADERS)
+            self._session_loop = current_loop
         return self._session
 
     async def close(self):
