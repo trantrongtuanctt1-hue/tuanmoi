@@ -109,6 +109,12 @@ class SignalResult:
     ultra_4h_verdict: str = "⏳ NEUTRAL"
     ultra_4h_color:   str = "gray"
 
+    # ── ULTRA Score 1d ─────────────────────────────────────────────────────
+    ultra_1d_buy:     int = 0
+    ultra_1d_sell:    int = 0
+    ultra_1d_verdict: str = "⏳ NEUTRAL"
+    ultra_1d_color:   str = "gray"
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # HELPERS — giữ nguyên + bổ sung
@@ -911,6 +917,9 @@ def score_symbol(
     # B-4h: ULTRA score trên khung 4h
     u4h = _ultra_score_for_tf(df_4h, *_tf_args)
 
+    # B-1d: ULTRA score trên khung 1d
+    u1d = _ultra_score_for_tf(df_1d, *_tf_args)
+
     # Alias 15m fields (giữ tên cũ để không đổi code phía dưới)
     st_ai_is_bull   = u15["st_ai_bull"]
     st_ai_factor    = u15["st_ai_factor"]
@@ -934,9 +943,9 @@ def score_symbol(
     verdict      = u15["verdict"]
     verdict_color = u15["color"]
 
-    # Tổng hợp điểm cao nhất qua cả 3 TF (dùng cho direction + tags)
-    best_buy  = max(ultra_buy,  u1h["buy"],  u4h["buy"])
-    best_sell = max(ultra_sell, u1h["sell"], u4h["sell"])
+    # Tổng hợp điểm cao nhất qua cả 4 TF (dùng cho direction + tags)
+    best_buy  = max(ultra_buy,  u1h["buy"],  u4h["buy"],  u1d["buy"])
+    best_sell = max(ultra_sell, u1h["sell"], u4h["sell"], u1d["sell"])
 
     # Indicators 15m cũ (dùng cho check bên dưới)
     ck_st_buy  = st_ai_is_bull
@@ -1003,6 +1012,10 @@ def score_symbol(
         ultra_tags.append("4H🚀SB")
     elif u4h["sell"] >= 9:
         ultra_tags.append("4H🔻SS")
+    if u1d["buy"] >= 9:
+        ultra_tags.append("1D🚀SB")
+    elif u1d["sell"] >= 9:
+        ultra_tags.append("1D🔻SS")
     if ultra_tags:
         reasons += ultra_tags[:4]
 
@@ -1061,4 +1074,9 @@ def score_symbol(
         ultra_4h_sell     = u4h["sell"],
         ultra_4h_verdict  = u4h["verdict"],
         ultra_4h_color    = u4h["color"],
+        # ULTRA 1d
+        ultra_1d_buy      = u1d["buy"],
+        ultra_1d_sell     = u1d["sell"],
+        ultra_1d_verdict  = u1d["verdict"],
+        ultra_1d_color    = u1d["color"],
     )
