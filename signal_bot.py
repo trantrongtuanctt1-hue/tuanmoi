@@ -17,7 +17,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from scanner import Scanner
-from signals import SignalResult
+from signals import SignalResult, detect_fvg
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +221,7 @@ class TelegramBot:
             ("scan",   self._scan),
             ("top",    self._top),
             ("strong", self._strong),
+            ("fvg",    self._fvg),
             ("check",  self._check),
             ("status", self._status),
             ("debug",  self._debug),
@@ -241,6 +242,7 @@ class TelegramBot:
             "/scan   — Quét tất cả token, alert signal đủ điều kiện\n"
             "/top    — Top 5 tín hiệu mạnh nhất\n"
             "/strong — 1D STRONG BUY/SELL (ultra_1d ≥ 9)\n"
+            "/fvg BTC [tf] — FVG + iFVG của 1 token (tf: 5m 15m 1h 4h 1d)\n"
             "/check BTC — Phân tích chi tiết 1 token\n"
             "/debug  — Kiểm tra kết nối API\n"
             "/source — Xem API đang dùng\n"
@@ -386,6 +388,120 @@ class TelegramBot:
             f"✅ *Xong!* Đã gửi {len(strong_1d)} token 1D STRONG.",
             parse_mode="Markdown"
         )
+
+    async def _fvg(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """
+        /fvg BTC [tf]
+        tf mặc định: 15m. Hỗ trợ: 5m 15m 30m 1h 4h 1d
+        Hiển thị Bullish FVG, Bearish FVG, iFVG còn hiệu lực gần giá nhất.
+        Logic port đúng từ Pine Script Section T3.
+        """
+        args = c.args
+        if not args:
+            await u.message.reply_text(
+                "⚠️ Dùng: /fvg BTC hoặc /fvg BTCUSDT 1h\n"
+                "Timeframe hỗ trợ: 5m 15m 30m 1h 4h 1d"
+            )
+            return
+
+        sym = args[0].upper()
+        if not sym.endswith("USDT"):
+            sym += "USDT"
+
+        tf_input = args[1].lower() if len(args) > 1 else "15m"
+        valid_tfs = {"5m", "15m", "30m", "1h", "4h", "1d"}
+        if tf_input not in valid_tfs:
+            await u.message.reply_text(
+                f"⚠️ Timeframe `{tf_input}` không hợp lệ.\n"
+                f"Dùng: 5m | 15m | 30m | 1h | 4h | 1d"
+            )
+            return
+
+        await u.message.reply_text(
+            f"📐 Đang tính FVG cho *{sym}* ({tf_input})...",
+            parse_mode="Markdown"
+        )
+
+        df = await self.scanner.fetcher.fetch_ohlcv(sym, tf_input, limit=100)
+        if df is None or len(df) < 3:
+            await u.message.reply_text(
+                f"❌ Không lấy được dữ liệu {sym} ({tf_input}).\n"
+                f"Dùng /debug để kiểm tra kết nối."
+            )
+            return
+
+        result = detect_fvg(df, min_gap_pct=0.0, max_keep=5)
+        cur    = result["cur_price"]
+        bulls  = result["bull_fvgs"]
+        bears  = result["bear_fvgs"]
+        ifvgs  = result["ifvgs"]
+
+        def _fmt_fvg(fvg: dict, label: str, emoji: str) -> str:
+            top    = fvg["top"]
+            bot    = fvg["bottom"]
+            mid    = (top + bot) / 2
+            gap    = fvg["gap_pct"]
+            age    = fvg["age_bars"]
+            dist   = abs(mid - cur) / cur * 100 if cur > 0 else 0
+            above  = "⬆️ phía TRÊN" if mid > cur else "⬇️ phía DƯỚI"
+            status = fvg.get("status", "active")
+            status_tag = ""
+            if status == "ifvg_bull":
+                status_tag = " _(iFVG — đã phá lên)_"
+            elif status == "ifvg_bear":
+                status_tag = " _(iFVG — đã phá xuống)_"
+            return (
+                f"{emoji} *{label}*{status_tag}\n"
+                f"  Top: `{top:.4f}` | Bot: `{bot:.4f}` | Mid: `{mid:.4f}`\n"
+                f"  Gap: `{gap:.3f}%` | Cách giá: `{dist:.2f}%` {above}\n"
+                f"  ⏳ {age} nến trước\n"
+            )
+
+        lines = [
+            f"📐 *FVG — {sym}* `({tf_input})`\n"
+            f"💰 Giá hiện tại: `{cur:.4f}`\n"
+            f"{'─' * 30}\n"
+        ]
+
+        if bulls:
+            lines.append(f"🟢 *Bullish FVG* ({len(bulls)} vùng)\n")
+            for i, fvg in enumerate(bulls, 1):
+                lines.append(_fmt_fvg(fvg, f"Bull FVG #{i}", "🟩"))
+        else:
+            lines.append("🟢 *Bullish FVG*: Không có vùng hiệu lực\n")
+
+        lines.append(f"{'─' * 30}\n")
+
+        if bears:
+            lines.append(f"🔴 *Bearish FVG* ({len(bears)} vùng)\n")
+            for i, fvg in enumerate(bears, 1):
+                lines.append(_fmt_fvg(fvg, f"Bear FVG #{i}", "🟥"))
+        else:
+            lines.append("🔴 *Bearish FVG*: Không có vùng hiệu lực\n")
+
+        lines.append(f"{'─' * 30}\n")
+
+        if ifvgs:
+            lines.append(f"🔵 *iFVG* ({len(ifvgs)} vùng — đã bị phá nhưng chưa hoàn toàn)\n")
+            for i, fvg in enumerate(ifvgs, 1):
+                dir_lbl = "Bull iFVG" if fvg.get("status") == "ifvg_bull" else "Bear iFVG"
+                lines.append(_fmt_fvg(fvg, f"{dir_lbl} #{i}", "🔷"))
+        else:
+            lines.append("🔵 *iFVG*: Không có\n")
+
+        lines.append(
+            f"{'─' * 30}\n"
+            f"_📌 Dùng /fvg {sym[:-4]} 1h hoặc /fvg {sym[:-4]} 4h để xem TF khác_"
+        )
+
+        msg = "".join(lines)
+        # Chia nhỏ nếu quá dài
+        if len(msg) > 4096:
+            chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
+            for chunk in chunks:
+                await u.message.reply_text(chunk, parse_mode="Markdown")
+        else:
+            await u.message.reply_text(msg, parse_mode="Markdown")
 
     async def _check(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         args = c.args
