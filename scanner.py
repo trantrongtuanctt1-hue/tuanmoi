@@ -69,11 +69,12 @@ class Scanner:
             if ignore_threshold:
                 return result
 
-            # Pass nếu 15m ULTRA >= ngưỡng HOẶC 1h / 4h có STRONG BUY/SELL
+            # Pass nếu 15m ULTRA >= ngưỡng HOẶC 1h / 4h / 1d có STRONG BUY/SELL
             ultra_15m = max(result.ultra_buy_score, result.ultra_sell_score)
             ultra_1h  = max(result.ultra_1h_buy,    result.ultra_1h_sell)
             ultra_4h  = max(result.ultra_4h_buy,    result.ultra_4h_sell)
-            if ultra_15m >= self.min_score or ultra_1h >= self.min_score or ultra_4h >= self.min_score:
+            ultra_1d  = max(result.ultra_1d_buy,    result.ultra_1d_sell)
+            if ultra_15m >= self.min_score or ultra_1h >= self.min_score or ultra_4h >= self.min_score or ultra_1d >= self.min_score:
                 return result
             return None
 
@@ -99,7 +100,8 @@ class Scanner:
             key=lambda x: (
                 max(x.ultra_buy_score, x.ultra_sell_score,
                     x.ultra_1h_buy, x.ultra_1h_sell,
-                    x.ultra_4h_buy, x.ultra_4h_sell),
+                    x.ultra_4h_buy, x.ultra_4h_sell,
+                    x.ultra_1d_buy, x.ultra_1d_sell),
                 x.score,
             ),
             reverse=True,
