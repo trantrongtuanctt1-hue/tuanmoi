@@ -1080,3 +1080,126 @@ def score_symbol(
         ultra_1d_verdict  = u1d["verdict"],
         ultra_1d_color    = u1d["color"],
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# FVG DETECTOR  (port từ Section T3 Pine Script — FVG + iFVG)
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_fvg(
+    df: pd.DataFrame,
+    min_gap_pct: float = 0.0,   # % tối thiểu của gap / price (0 = lấy mọi gap)
+    max_keep: int = 10,          # giữ tối đa N FVG gần nhất mỗi loại
+) -> dict:
+    """
+    Port đúng logic Pine Script Section T3:
+      Bullish FVG : low[i] > high[i-2]  → gap [high[i-2], low[i]]
+      Bearish FVG : high[i] < low[i-2] → gap [high[i], low[i-2]]
+      iFVG        : FVG bị phá vỡ nhưng chưa close qua toàn bộ gap
+                    (bullish FVG bị close phá xuống dưới high[i-2] → iFVG bear)
+                    (bearish FVG bị close phá lên trên low[i-2]   → iFVG bull)
+
+    Trả dict:
+      bull_fvgs : list[dict]  — các Bullish FVG còn hiệu lực
+      bear_fvgs : list[dict]  — các Bearish FVG còn hiệu lực
+      ifvgs     : list[dict]  — các iFVG còn hiệu lực
+      cur_price : float
+
+    Mỗi FVG dict:
+      top, bottom : mức giá trên/dưới của gap
+      bar_idx     : index của nến tạo FVG (i trong df)
+      age_bars    : bao nhiêu nến trước đây
+      gap_pct     : % gap so với price
+      status      : "active" | "ifvg_bull" | "ifvg_bear"
+    """
+    if df is None or len(df) < 3:
+        return {"bull_fvgs": [], "bear_fvgs": [], "ifvgs": [], "cur_price": 0.0}
+
+    highs  = df["high"].values
+    lows   = df["low"].values
+    closes = df["close"].values
+    n      = len(df)
+    cur_price = float(closes[-1])
+
+    bull_fvgs: list[dict] = []
+    bear_fvgs: list[dict] = []
+    ifvgs:     list[dict] = []
+
+    # ── Quét toàn bộ lịch sử để tìm FVG ──────────────────────────────────
+    for i in range(2, n):
+        price_ref = closes[i] if closes[i] > 0 else 1.0
+
+        # Bullish FVG: low[i] > high[i-2]
+        if lows[i] > highs[i - 2]:
+            top    = float(lows[i])
+            bottom = float(highs[i - 2])
+            gap_pct = (top - bottom) / price_ref * 100.0
+            if gap_pct >= min_gap_pct:
+                bull_fvgs.append({
+                    "top":      top,
+                    "bottom":   bottom,
+                    "bar_idx":  i,
+                    "age_bars": n - 1 - i,
+                    "gap_pct":  round(gap_pct, 3),
+                    "status":   "active",
+                })
+
+        # Bearish FVG: high[i] < low[i-2]
+        if highs[i] < lows[i - 2]:
+            top    = float(lows[i - 2])
+            bottom = float(highs[i])
+            gap_pct = (top - bottom) / price_ref * 100.0
+            if gap_pct >= min_gap_pct:
+                bear_fvgs.append({
+                    "top":      top,
+                    "bottom":   bottom,
+                    "bar_idx":  i,
+                    "age_bars": n - 1 - i,
+                    "gap_pct":  round(gap_pct, 3),
+                    "status":   "active",
+                })
+
+    # ── Invalidation + iFVG (dùng close cuối để kiểm tra) ─────────────────
+    # Bullish FVG bị phá: close < bottom → convert sang iFVG bear
+    surviving_bull: list[dict] = []
+    for fvg in bull_fvgs:
+        # Kiểm tra tất cả closes sau khi FVG hình thành
+        future_closes = closes[fvg["bar_idx"] + 1:]
+        broken = any(c < fvg["bottom"] for c in future_closes)
+        if broken:
+            fvg["status"] = "ifvg_bear"
+            # iFVG chỉ còn hiệu lực nếu close hiện tại chưa thoát hoàn toàn
+            # (close > top nghĩa là phục hồi qua hết → xoá iFVG)
+            if cur_price < fvg["top"]:
+                ifvgs.append(fvg)
+        else:
+            surviving_bull.append(fvg)
+
+    # Bearish FVG bị phá: close > top → convert sang iFVG bull
+    surviving_bear: list[dict] = []
+    for fvg in bear_fvgs:
+        future_closes = closes[fvg["bar_idx"] + 1:]
+        broken = any(c > fvg["top"] for c in future_closes)
+        if broken:
+            fvg["status"] = "ifvg_bull"
+            if cur_price > fvg["bottom"]:
+                ifvgs.append(fvg)
+        else:
+            surviving_bear.append(fvg)
+
+    # ── Chỉ giữ FVG gần nhất (chưa bị phá, gần price nhất) ───────────────
+    # Sort theo khoảng cách với giá hiện tại
+    def _dist(fvg):
+        mid = (fvg["top"] + fvg["bottom"]) / 2
+        return abs(mid - cur_price)
+
+    surviving_bull.sort(key=_dist)
+    surviving_bear.sort(key=_dist)
+    ifvgs.sort(key=_dist)
+
+    return {
+        "bull_fvgs": surviving_bull[:max_keep],
+        "bear_fvgs": surviving_bear[:max_keep],
+        "ifvgs":     ifvgs[:max_keep],
+        "cur_price": cur_price,
+    }
