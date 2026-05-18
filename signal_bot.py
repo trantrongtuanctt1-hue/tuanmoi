@@ -220,6 +220,7 @@ class TelegramBot:
             ("help",   self._help),
             ("scan",   self._scan),
             ("top",    self._top),
+            ("strong", self._strong),
             ("check",  self._check),
             ("status", self._status),
             ("debug",  self._debug),
@@ -237,10 +238,11 @@ class TelegramBot:
     async def _help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
             "📖 *Lệnh*\n"
-            "/scan — Quét tất cả token, alert signal đủ điều kiện\n"
-            "/top  — Top 5 tín hiệu mạnh nhất\n"
+            "/scan   — Quét tất cả token, alert signal đủ điều kiện\n"
+            "/top    — Top 5 tín hiệu mạnh nhất\n"
+            "/strong — 1D STRONG BUY/SELL (ultra_1d ≥ 9)\n"
             "/check BTC — Phân tích chi tiết 1 token\n"
-            "/debug — Kiểm tra kết nối API\n"
+            "/debug  — Kiểm tra kết nối API\n"
             "/source — Xem API đang dùng\n"
             "/status — Trạng thái bot\n\n"
             "📊 *15M ULTRA Dashboard*\n"
@@ -319,6 +321,71 @@ class TelegramBot:
                 chunk += line
         if chunk:
             await u.message.reply_text(chunk, parse_mode="Markdown")
+
+    async def _strong(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """
+        /strong — hiển thị các token có ULTRA 1D STRONG BUY hoặc STRONG SELL (≥9).
+        Dùng ngưỡng thấp hơn khi scan (bỏ qua min_score bình thường) để không bỏ sót.
+        """
+        await u.message.reply_text("📅 Đang quét 1D STRONG (ultra_1d ≥ 9)... (~90s)")
+
+        # Scan toàn bộ với ignore_threshold để lấy mọi kết quả, sau đó tự lọc
+        symbols = await self.scanner.fetcher.fetch_top_symbols(self.scanner.max_symbols)
+
+        import asyncio
+        from scanner import CONCURRENCY
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def _fetch_one(sym):
+            async with sem:
+                return await self.scanner._analyse_one(sym, ignore_threshold=True)
+
+        results = await asyncio.gather(*[_fetch_one(s) for s in symbols])
+
+        # Lọc chỉ giữ token có 1D STRONG BUY hoặc STRONG SELL
+        strong_1d = [
+            r for r in results
+            if r is not None and (r.ultra_1d_buy >= 9 or r.ultra_1d_sell >= 9)
+        ]
+
+        # Sort: 1D score cao nhất trước
+        strong_1d.sort(
+            key=lambda x: max(x.ultra_1d_buy, x.ultra_1d_sell),
+            reverse=True,
+        )
+
+        if not strong_1d:
+            await u.message.reply_text(
+                "❌ Không có token nào đạt 1D STRONG (ultra_1d ≥ 9) lúc này.\n"
+                "Dùng /scan để xem tín hiệu ngắn hạn."
+            )
+            return
+
+        buy_cnt  = sum(1 for r in strong_1d if r.ultra_1d_buy >= r.ultra_1d_sell)
+        sell_cnt = len(strong_1d) - buy_cnt
+
+        await u.message.reply_text(
+            f"📅 *1D STRONG* — {len(strong_1d)} token\n"
+            f"🟢 STRONG BUY: {buy_cnt}  |  🔴 STRONG SELL: {sell_cnt}\n"
+            f"_(Gửi từng signal bên dưới…)_",
+            parse_mode="Markdown"
+        )
+
+        for r in strong_1d:
+            # Tạo prefix rõ hướng 1D
+            if r.ultra_1d_buy >= 9 and r.ultra_1d_buy >= r.ultra_1d_sell:
+                label = f"📅🟢 *1D STRONG BUY* — score {r.ultra_1d_buy}/11"
+            else:
+                label = f"📅🔴 *1D STRONG SELL* — score {r.ultra_1d_sell}/11"
+            await u.message.reply_text(
+                f"{label}\n\n{_fmt(r)}",
+                parse_mode="Markdown"
+            )
+
+        await u.message.reply_text(
+            f"✅ *Xong!* Đã gửi {len(strong_1d)} token 1D STRONG.",
+            parse_mode="Markdown"
+        )
 
     async def _check(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         args = c.args
