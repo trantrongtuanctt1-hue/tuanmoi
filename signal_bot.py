@@ -106,8 +106,10 @@ def _fmt(r: SignalResult) -> str:
 
     u1h_color = _uc(r.ultra_1h_color)
     u4h_color = _uc(r.ultra_4h_color)
+    u1d_color = _uc(r.ultra_1d_color)
     u1h_bar   = _ubar(r.ultra_1h_buy, r.ultra_1h_sell)
     u4h_bar   = _ubar(r.ultra_4h_buy, r.ultra_4h_sell)
+    u1d_bar   = _ubar(r.ultra_1d_buy, r.ultra_1d_sell)
 
     msg = (
         f"{dir_emoji} *{r.symbol}*  [{r.direction}]  SXL: *{r.score}/10*\n"
@@ -149,6 +151,11 @@ def _fmt(r: SignalResult) -> str:
         f"  `{u4h_bar}`\n"
         f"  Verdict: *{r.ultra_4h_verdict}*\n"
         f"{'─' * 30}\n"
+        f"📅 *ULTRA Score 1D*\n"
+        f"  {u1d_color} BUY {r.ultra_1d_buy}↑ / SELL {r.ultra_1d_sell}↓ /11\n"
+        f"  `{u1d_bar}`\n"
+        f"  Verdict: *{r.ultra_1d_verdict}*\n"
+        f"{'─' * 30}\n"
         f"{vol_icon} *Volume Balance*\n"
         f"  ▲ Bull: {r.bull_pct}%  |  ▼ Bear: {r.bear_pct}%{vol_dom}\n"
         f"  Vol {vol_conf}\n"
@@ -183,12 +190,14 @@ def _fmt_short(r: SignalResult) -> str:
     def _uc(c): return "🟢" if c == "green" else ("🔴" if c == "red" else "⬜")
     u1h_em = _uc(r.ultra_1h_color)
     u4h_em = _uc(r.ultra_4h_color)
+    u1d_em = _uc(r.ultra_1d_color)
 
     return (
         f"{dir_emoji} *{r.symbol}*{prem}  SXL:`{r.score}/10`  15m:`{r.ultra_buy_score}↑{r.ultra_sell_score}↓`{spk}\n"
         f"  {v_em} *{r.ultra_verdict}*  "
         f"1H:{u1h_em}`{r.ultra_1h_buy}↑{r.ultra_1h_sell}↓` *{r.ultra_1h_verdict}*\n"
-        f"  4H:{u4h_em}`{r.ultra_4h_buy}↑{r.ultra_4h_sell}↓` *{r.ultra_4h_verdict}*\n"
+        f"  4H:{u4h_em}`{r.ultra_4h_buy}↑{r.ultra_4h_sell}↓` *{r.ultra_4h_verdict}*  "
+        f"1D:{u1d_em}`{r.ultra_1d_buy}↑{r.ultra_1d_sell}↓` *{r.ultra_1d_verdict}*\n"
         f"  ST-AI:{_arr(r.st_ai_bull)} UT:{ut_txt} SAR:{_arr(r.sar_bull_val)} "
         f"Zone:{zone_icon}{r.zone}({r.zone_pct}%) CTX:{mtf_ctx}\n"
         f"  RSI▲{r.rsi_bull_count}/6 ▼{r.rsi_bear_count}/6 | "
@@ -262,10 +271,12 @@ class TelegramBot:
 
         strong   = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
                                               r.ultra_1h_buy, r.ultra_1h_sell,
-                                              r.ultra_4h_buy, r.ultra_4h_sell) >= 9]
+                                              r.ultra_4h_buy, r.ultra_4h_sell,
+                                              r.ultra_1d_buy, r.ultra_1d_sell) >= 9]
         mid      = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
                                               r.ultra_1h_buy, r.ultra_1h_sell,
-                                              r.ultra_4h_buy, r.ultra_4h_sell) == 8]
+                                              r.ultra_4h_buy, r.ultra_4h_sell,
+                                              r.ultra_1d_buy, r.ultra_1d_sell) == 8]
         premiums = [r for r in signals if r.is_premium]
         spikes   = [r for r in signals if r.is_spike]
 
@@ -396,7 +407,8 @@ class TelegramBot:
         try:
             ultra_max = max(result.ultra_buy_score, result.ultra_sell_score,
                         result.ultra_1h_buy,    result.ultra_1h_sell,
-                        result.ultra_4h_buy,    result.ultra_4h_sell)
+                        result.ultra_4h_buy,    result.ultra_4h_sell,
+                        result.ultra_1d_buy,    result.ultra_1d_sell)
             if ultra_max >= 9:
                 prefix = "🚨🚀 *AUTO ALERT — STRONG*"
             elif ultra_max >= 7:
