@@ -216,16 +216,17 @@ class TelegramBot:
         self.scanner = scanner
         self.app     = Application.builder().token(token).build()
         for cmd, fn in [
-            ("start",  self._start),
-            ("help",   self._help),
-            ("scan",   self._scan),
-            ("top",    self._top),
-            ("strong", self._strong),
-            ("fvg",    self._fvg),
-            ("check",  self._check),
-            ("status", self._status),
-            ("debug",  self._debug),
-            ("source", self._source),
+            ("start",    self._start),
+            ("help",     self._help),
+            ("scan",     self._scan),
+            ("top",      self._top),
+            ("strong",   self._strong),
+            ("fvg",      self._fvg),
+            ("fvgscan",  self._fvgscan),
+            ("check",    self._check),
+            ("status",   self._status),
+            ("debug",    self._debug),
+            ("source",   self._source),
         ]:
             self.app.add_handler(CommandHandler(cmd, fn))
 
@@ -243,6 +244,7 @@ class TelegramBot:
             "/top    — Top 5 tín hiệu mạnh nhất\n"
             "/strong — 1D STRONG BUY/SELL (ultra_1d ≥ 9)\n"
             "/fvg BTC [tf] — FVG + iFVG của 1 token (tf: 5m 15m 1h 4h 1d)\n"
+            "/fvgscan [tf] — Quét toàn market, tìm token đang NẰM TRONG FVG\n"
             "/check BTC — Phân tích chi tiết 1 token\n"
             "/debug  — Kiểm tra kết nối API\n"
             "/source — Xem API đang dùng\n"
@@ -388,6 +390,86 @@ class TelegramBot:
             f"✅ *Xong!* Đã gửi {len(strong_1d)} token 1D STRONG.",
             parse_mode="Markdown"
         )
+
+    async def _fvgscan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """
+        /fvgscan [tf]
+        Quét toàn bộ market (chỉ fetch TF được chỉ định, mặc định 4h).
+        Tìm tất cả token có giá hiện tại đang nằm TRONG vùng FVG.
+        Sort theo khoảng cách tới mid FVG (gần nhất trước).
+        """
+        args    = c.args
+        tf      = args[0].lower() if args else "4h"
+        valid_tfs = {"5m", "15m", "30m", "1h", "4h", "1d"}
+        if tf not in valid_tfs:
+            await u.message.reply_text(
+                f"⚠️ Timeframe `{tf}` không hợp lệ.\nDùng: 5m | 15m | 30m | 1h | 4h | 1d"
+            )
+            return
+
+        await u.message.reply_text(
+            f"📐 Đang quét *toàn market* — FVG `{tf}` (~60–90s)...\n"
+            f"_Chỉ lấy token giá đang NẰM TRONG vùng FVG_",
+            parse_mode="Markdown"
+        )
+
+        hits = await self.scanner.scan_fvg(tf=tf)
+
+        if not hits:
+            await u.message.reply_text(
+                f"❌ Không có token nào đang nằm trong FVG {tf} lúc này."
+            )
+            return
+
+        # Phân loại
+        bull_hits  = [h for h in hits if h["fvg_type"] == "bull"]
+        bear_hits  = [h for h in hits if h["fvg_type"] == "bear"]
+        ifvg_hits  = [h for h in hits if h["fvg_type"] not in ("bull", "bear")]
+
+        def _row(h: dict) -> str:
+            t     = h["fvg_type"]
+            emoji = "🟢" if t == "bull" else ("🔴" if t == "bear" else "🔵")
+            side  = "Bull" if t == "bull" else ("Bear" if t == "bear" else "iFVG")
+            sym   = h["symbol"].replace("USDT", "")
+            above_mid = "↑mid" if h["cur_price"] >= h["fvg_mid"] else "↓mid"
+            return (
+                f"{emoji} *{sym}*  `{h['cur_price']:.4f}`  [{side}]\n"
+                f"  Vùng: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`"
+                f"  Gap:`{h['gap_pct']:.2f}%`  Cách mid:`{h['dist_pct']:.2f}%`{above_mid}"
+                f"  _{h['age_bars']}nến_\n"
+            )
+
+        header = (
+            f"📐 *FVG Scan {tf.upper()}* — {len(hits)} token trong FVG\n"
+            f"🟢 Bull: {len(bull_hits)}  🔴 Bear: {len(bear_hits)}  🔵 iFVG: {len(ifvg_hits)}\n"
+            f"{'─'*30}\n"
+        )
+
+        # Build các section, gửi theo chunk ≤ 4000 ký tự
+        sections = []
+        if bull_hits:
+            sections.append(f"🟢 *Bullish FVG* ({len(bull_hits)} token)\n")
+            for h in bull_hits:
+                sections.append(_row(h))
+        if bear_hits:
+            sections.append(f"\n🔴 *Bearish FVG* ({len(bear_hits)} token)\n")
+            for h in bear_hits:
+                sections.append(_row(h))
+        if ifvg_hits:
+            sections.append(f"\n🔵 *iFVG* ({len(ifvg_hits)} token)\n")
+            for h in ifvg_hits:
+                sections.append(_row(h))
+
+        # Gom thành các chunk
+        chunk = header
+        for line in sections:
+            if len(chunk) + len(line) > 3900:
+                await u.message.reply_text(chunk, parse_mode="Markdown")
+                chunk = line
+            else:
+                chunk += line
+        if chunk:
+            await u.message.reply_text(chunk, parse_mode="Markdown")
 
     async def _fvg(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         """
