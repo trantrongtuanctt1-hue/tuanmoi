@@ -12,7 +12,7 @@ import time
 from typing import Optional
 
 from fetcher import BybitFetcher
-from signals import SignalResult, score_symbol
+from signals import SignalResult, score_symbol, detect_fvg
 
 logger = logging.getLogger(__name__)
 
@@ -145,3 +145,70 @@ class Scanner:
         if not sym.endswith("USDT"):
             sym += "USDT"
         return await self._analyse_one(sym, ignore_threshold=True)
+
+    async def scan_fvg(self, tf: str = "4h", limit: int = 100) -> list[dict]:
+        """
+        Quét toàn bộ market, tìm token có giá đang NẰM TRONG FVG của timeframe `tf`.
+        Chỉ fetch 1 TF duy nhất → nhanh hơn nhiều so với full scan 6TF.
+
+        Trả list[dict]:
+          symbol, cur_price, fvg_type ("bull"|"bear"|"ifvg_bull"|"ifvg_bear"),
+          fvg_top, fvg_bot, fvg_mid, gap_pct, dist_pct, age_bars
+        Sort: dist_pct tăng dần (gần mid FVG nhất trước).
+        """
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(f"FVG scan: {len(symbols)} symbols, tf={tf}")
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def _check_one(sym: str) -> list[dict]:
+            async with sem:
+                try:
+                    df = await self.fetcher.fetch_ohlcv(sym, tf, limit=limit)
+                    if df is None or len(df) < 3:
+                        return []
+
+                    res = detect_fvg(df, min_gap_pct=0.0, max_keep=10)
+                    cur = res["cur_price"]
+                    if cur <= 0:
+                        return []
+
+                    hits = []
+
+                    def _check_fvg_list(fvgs: list, fvg_type: str):
+                        for fvg in fvgs:
+                            top = fvg["top"]
+                            bot = fvg["bottom"]
+                            # Giá đang NẰM TRONG vùng FVG
+                            if bot <= cur <= top:
+                                mid      = (top + bot) / 2
+                                dist_pct = abs(cur - mid) / mid * 100 if mid > 0 else 0
+                                hits.append({
+                                    "symbol":    sym,
+                                    "cur_price": cur,
+                                    "fvg_type":  fvg_type,
+                                    "fvg_top":   top,
+                                    "fvg_bot":   bot,
+                                    "fvg_mid":   round(mid, 6),
+                                    "gap_pct":   fvg["gap_pct"],
+                                    "dist_pct":  round(dist_pct, 2),
+                                    "age_bars":  fvg["age_bars"],
+                                })
+
+                    _check_fvg_list(res["bull_fvgs"], "bull")
+                    _check_fvg_list(res["bear_fvgs"], "bear")
+                    for ifvg in res["ifvgs"]:
+                        _check_fvg_list([ifvg], ifvg.get("status", "ifvg"))
+
+                    return hits
+                except Exception as e:
+                    logger.debug(f"scan_fvg {sym}: {e}")
+                    return []
+
+        all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
+
+        hits = [item for sublist in all_lists for item in sublist]
+        # Sort: gần mid FVG nhất trước
+        hits.sort(key=lambda x: x["dist_pct"])
+        logger.info(f"FVG scan done: {len(hits)} tokens in FVG ({tf})")
+        return hits
