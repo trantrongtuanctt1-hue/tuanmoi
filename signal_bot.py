@@ -223,6 +223,7 @@ class TelegramBot:
             ("strong",   self._strong),
             ("fvg",      self._fvg),
             ("fvgscan",  self._fvgscan),
+            ("ft",       self._ft),
             ("check",    self._check),
             ("status",   self._status),
             ("debug",    self._debug),
@@ -240,15 +241,16 @@ class TelegramBot:
     async def _help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
             "📖 *Lệnh*\n"
-            "/scan   — Quét tất cả token, alert signal đủ điều kiện\n"
-            "/top    — Top 5 tín hiệu mạnh nhất\n"
-            "/strong — 1D STRONG BUY/SELL (ultra_1d ≥ 9)\n"
-            "/fvg BTC [tf] — FVG + iFVG của 1 token (tf: 5m 15m 1h 4h 1d)\n"
-            "/fvgscan [tf] — Quét toàn market, tìm token đang NẰM TRONG FVG\n"
+            "/scan     — Quét tất cả token, signal đủ điều kiện\n"
+            "/top      — Top 5 tín hiệu mạnh nhất\n"
+            "/strong   — 1D STRONG BUY/SELL (ultra_1d ≥ 9)\n"
+            "/ft       — 🔥 FVG 4h + 15m SELL ≥ 8 (toàn market)\n"
+            "/fvgscan [tf] — Toàn market đang trong FVG (mặc định 4h)\n"
+            "/fvg BTC [tf] — FVG của 1 token (tf: 5m 15m 1h 4h 1d)\n"
             "/check BTC — Phân tích chi tiết 1 token\n"
-            "/debug  — Kiểm tra kết nối API\n"
-            "/source — Xem API đang dùng\n"
-            "/status — Trạng thái bot\n\n"
+            "/debug    — Kiểm tra kết nối API\n"
+            "/source   — Xem API đang dùng\n"
+            "/status   — Trạng thái bot\n\n"
             "📊 *15M ULTRA Dashboard*\n"
             "• ⚡ SuperTrend AI (tự chọn factor tốt nhất)\n"
             "• UT Bot (trailing stop Long/Short)\n"
@@ -390,6 +392,73 @@ class TelegramBot:
             f"✅ *Xong!* Đã gửi {len(strong_1d)} token 1D STRONG.",
             parse_mode="Markdown"
         )
+
+    async def _ft(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """
+        /ft — Quét toàn market:
+          ✅ Giá đang NẰM TRONG FVG 4h
+          ✅ 15m ULTRA SELL score >= 8
+        Hai điều kiện phải đồng thời → setup Short confluence mạnh.
+        """
+        await u.message.reply_text(
+            "🔥 Đang quét *FVG 4h + 15m SELL ≥ 8* toàn market (~60–90s)...",
+            parse_mode="Markdown"
+        )
+
+        hits = await self.scanner.scan_ft()
+
+        if not hits:
+            await u.message.reply_text(
+                "❌ Không có token nào đủ điều kiện:\n"
+                "• Giá trong FVG 4h  AND\n"
+                "• 15m ULTRA SELL ≥ 8"
+            )
+            return
+
+        # Nhóm theo sell_score
+        score9 = [h for h in hits if h["sell_score"] >= 9]
+        score8 = [h for h in hits if h["sell_score"] == 8]
+
+        def _row(h: dict) -> str:
+            sym      = h["symbol"].replace("USDT", "")
+            ftype    = h.get("fvg_type", "")
+            f_emoji  = "🟢" if ftype == "bull" else "🔴"
+            f_label  = "BullFVG" if ftype == "bull" else "BearFVG"
+            sell     = h["sell_score"]
+            s_emoji  = "🔥" if sell >= 9 else "⚡"
+            above_mid = "↑mid" if h["cur_price"] >= h["fvg_mid"] else "↓mid"
+            return (
+                f"{s_emoji} *{sym}*  `{h['cur_price']:.4f}`  {f_emoji}{f_label}\n"
+                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`"
+                f"  Gap:`{h['gap_pct']:.2f}%`  Cách mid:`{h['dist_pct']:.2f}%`{above_mid}\n"
+                f"  15m SELL:`{sell}/11`  _{h['age_bars']} nến_\n"
+            )
+
+        header = (
+            f"🔥 *FVG 4h + 15m SELL* — {len(hits)} token\n"
+            f"🔥 STRONG (≥9): {len(score9)}  ⚡ MED (=8): {len(score8)}\n"
+            f"{'─'*30}\n"
+        )
+
+        sections = []
+        if score9:
+            sections.append(f"🔥 *STRONG SELL ≥9* ({len(score9)} token)\n")
+            for h in score9:
+                sections.append(_row(h))
+        if score8:
+            sections.append(f"\n⚡ *SELL ≥8* ({len(score8)} token)\n")
+            for h in score8:
+                sections.append(_row(h))
+
+        chunk = header
+        for line in sections:
+            if len(chunk) + len(line) > 3900:
+                await u.message.reply_text(chunk, parse_mode="Markdown")
+                chunk = line
+            else:
+                chunk += line
+        if chunk:
+            await u.message.reply_text(chunk, parse_mode="Markdown")
 
     async def _fvgscan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         """
