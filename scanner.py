@@ -221,32 +221,36 @@ class Scanner:
     _FVG_BUFFER = {"1h": 0.003, "4h": 0.005, "1d": 0.010}
 
     # Mapping score_tf → kwargs đúng cho score_symbol
-    # Chỉ pass df vào đúng slot TF, còn lại None
     @staticmethod
     def _score_kwargs(score_tf: str, df_score, fvg_tf: str, df_fvg) -> dict:
         """
-        Tránh bug pass df_fvg vào df_4h khi fvg_tf != 4h.
-        Mỗi slot chỉ nhận df đúng timeframe của nó.
+        Build kwargs cho score_symbol:
+          - df_5m + df_15m luôn được set = df_score (base bắt buộc)
+          - slot đúng với score_tf cũng được set = df_score
+          - slot đúng với fvg_tf được set = df_fvg (nếu khác score_tf)
+          - các slot còn lại = None
+
+        Lý do set cả df_5m/df_15m: score_symbol dùng chúng làm
+        base tính toán; nếu None thì ultra_score trả 0 dù có df_1h.
         """
-        kwargs = dict(df_5m=None, df_15m=None, df_30m=None,
-                      df_1h=None, df_4h=None, df_1d=None)
-        # Điền df_score vào đúng slot score_tf
-        slot_score = {
+        TF_SLOT = {
             "5m": "df_5m", "15m": "df_15m", "30m": "df_30m",
             "1h": "df_1h", "4h":  "df_4h",  "1d":  "df_1d",
-        }.get(score_tf)
+        }
+        kwargs = dict(df_5m=None, df_15m=None, df_30m=None,
+                      df_1h=None, df_4h=None,  df_1d=None)
+
+        # Base bắt buộc — score_symbol cần ít nhất df_5m hoặc df_15m
+        kwargs["df_5m"]  = df_score
+        kwargs["df_15m"] = df_score
+
+        # Override đúng slot score_tf
+        slot_score = TF_SLOT.get(score_tf)
         if slot_score:
             kwargs[slot_score] = df_score
-            # score_symbol cần ít nhất df_5m hoặc df_15m làm base
-            if slot_score not in ("df_5m", "df_15m"):
-                kwargs["df_5m"]  = df_score
-                kwargs["df_15m"] = df_score
 
-        # Điền df_fvg vào đúng slot fvg_tf (nếu khác slot score)
-        slot_fvg = {
-            "5m": "df_5m", "15m": "df_15m", "30m": "df_30m",
-            "1h": "df_1h", "4h":  "df_4h",  "1d":  "df_1d",
-        }.get(fvg_tf)
+        # Điền df_fvg vào đúng slot fvg_tf (tránh ghi đè slot score)
+        slot_fvg = TF_SLOT.get(fvg_tf)
         if slot_fvg and slot_fvg != slot_score:
             kwargs[slot_fvg] = df_fvg
 
