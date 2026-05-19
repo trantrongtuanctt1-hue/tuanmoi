@@ -395,13 +395,11 @@ class TelegramBot:
 
     async def _ft(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         """
-        /ft — Quét toàn market:
-          ✅ Giá đang NẰM TRONG FVG 4h
-          ✅ 15m ULTRA SELL score >= 8
-        Hai điều kiện phải đồng thời → setup Short confluence mạnh.
+        /ft — FVG 4h (buffer ±0.5%) + 15m SELL ≥ 6
+        Tier: 🔥 STRONG (sell≥9 + trong FVG) | ⚡ GOOD (sell≥8) | 📌 WATCH (sell≥6)
         """
         await u.message.reply_text(
-            "🔥 Đang quét *FVG 4h + 15m SELL ≥ 8* toàn market (~60–90s)...",
+            "🔥 Đang quét *FVG 4h + 15m SELL* toàn market (~60–90s)...",
             parse_mode="Markdown"
         )
 
@@ -409,45 +407,48 @@ class TelegramBot:
 
         if not hits:
             await u.message.reply_text(
-                "❌ Không có token nào đủ điều kiện:\n"
-                "• Giá trong FVG 4h  AND\n"
-                "• 15m ULTRA SELL ≥ 8"
+                "❌ Không tìm được token nào.\n"
+                "Thị trường chưa có setup FVG 4h + SELL 15m lúc này."
             )
             return
 
-        # Nhóm theo sell_score
-        score9 = [h for h in hits if h["sell_score"] >= 9]
-        score8 = [h for h in hits if h["sell_score"] == 8]
+        strong = [h for h in hits if h["tier"] == "🔥"]
+        good   = [h for h in hits if h["tier"] == "⚡"]
+        watch  = [h for h in hits if h["tier"] == "📌"]
 
         def _row(h: dict) -> str:
-            sym      = h["symbol"].replace("USDT", "")
-            ftype    = h.get("fvg_type", "")
-            f_emoji  = "🟢" if ftype == "bull" else "🔴"
-            f_label  = "BullFVG" if ftype == "bull" else "BearFVG"
-            sell     = h["sell_score"]
-            s_emoji  = "🔥" if sell >= 9 else "⚡"
-            above_mid = "↑mid" if h["cur_price"] >= h["fvg_mid"] else "↓mid"
+            sym     = h["symbol"].replace("USDT", "")
+            ftype   = h.get("fvg_type", "")
+            f_em    = "🟢" if "bull" in ftype else ("🔴" if "bear" in ftype else "🔵")
+            f_lbl   = "BullFVG" if "bull" in ftype else ("BearFVG" if "bear" in ftype else "iFVG")
+            pos     = "✅trong" if h.get("inside") else "🔔gần"
+            ab_mid  = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
             return (
-                f"{s_emoji} *{sym}*  `{h['cur_price']:.4f}`  {f_emoji}{f_label}\n"
-                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`"
-                f"  Gap:`{h['gap_pct']:.2f}%`  Cách mid:`{h['dist_pct']:.2f}%`{above_mid}\n"
-                f"  15m SELL:`{sell}/11`  _{h['age_bars']} nến_\n"
+                f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`  {f_em}{f_lbl} {pos}\n"
+                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`  "
+                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  "
+                f"SELL:`{h['sell_score']}/11`  _{h['age_bars']}nến_\n"
             )
 
         header = (
             f"🔥 *FVG 4h + 15m SELL* — {len(hits)} token\n"
-            f"🔥 STRONG (≥9): {len(score9)}  ⚡ MED (=8): {len(score8)}\n"
+            f"🔥 Strong:{len(strong)}  ⚡ Good:{len(good)}  📌 Watch:{len(watch)}\n"
+            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)_\n"
             f"{'─'*30}\n"
         )
 
         sections = []
-        if score9:
-            sections.append(f"🔥 *STRONG SELL ≥9* ({len(score9)} token)\n")
-            for h in score9:
+        if strong:
+            sections.append(f"🔥 *STRONG* — sell≥9 + trong FVG ({len(strong)})\n")
+            for h in strong:
                 sections.append(_row(h))
-        if score8:
-            sections.append(f"\n⚡ *SELL ≥8* ({len(score8)} token)\n")
-            for h in score8:
+        if good:
+            sections.append(f"\n⚡ *GOOD* — sell≥8 ({len(good)})\n")
+            for h in good:
+                sections.append(_row(h))
+        if watch:
+            sections.append(f"\n📌 *WATCH* — sell≥6 ({len(watch)})\n")
+            for h in watch:
                 sections.append(_row(h))
 
         chunk = header
