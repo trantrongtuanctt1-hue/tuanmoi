@@ -224,6 +224,7 @@ class TelegramBot:
             ("fvg",      self._fvg),
             ("fvgscan",  self._fvgscan),
             ("ft",       self._ft),
+            ("fb",       self._fb),
             ("check",    self._check),
             ("status",   self._status),
             ("debug",    self._debug),
@@ -244,7 +245,8 @@ class TelegramBot:
             "/scan     — Quét tất cả token, signal đủ điều kiện\n"
             "/top      — Top 5 tín hiệu mạnh nhất\n"
             "/strong   — 1D STRONG BUY/SELL (ultra_1d ≥ 9)\n"
-            "/ft       — 🔥 FVG 4h + 15m SELL ≥ 8 (toàn market)\n"
+            "/ft       — 🔴 Bear FVG 4h + 15m SELL ≥ 6 (setup SHORT)\n"
+            "/fb       — 🟢 Bull FVG 4h + 15m BUY ≥ 6 (setup LONG)\n"
             "/fvgscan [tf] — Toàn market đang trong FVG (mặc định 4h)\n"
             "/fvg BTC [tf] — FVG của 1 token (tf: 5m 15m 1h 4h 1d)\n"
             "/check BTC — Phân tích chi tiết 1 token\n"
@@ -395,11 +397,11 @@ class TelegramBot:
 
     async def _ft(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         """
-        /ft — FVG 4h (buffer ±0.5%) + 15m SELL ≥ 6
+        /ft — Bear FVG 4h (buffer ±0.5%) + 15m SELL ≥ 6  →  setup SHORT
         Tier: 🔥 STRONG (sell≥9 + trong FVG) | ⚡ GOOD (sell≥8) | 📌 WATCH (sell≥6)
         """
         await u.message.reply_text(
-            "🔥 Đang quét *FVG 4h + 15m SELL* toàn market (~60–90s)...",
+            "🔴 Đang quét *Bear FVG 4h + 15m SELL* toàn market (~60–90s)...",
             parse_mode="Markdown"
         )
 
@@ -408,7 +410,7 @@ class TelegramBot:
         if not hits:
             await u.message.reply_text(
                 "❌ Không tìm được token nào.\n"
-                "Thị trường chưa có setup FVG 4h + SELL 15m lúc này."
+                "Thị trường chưa có setup Bear FVG 4h + SELL 15m lúc này."
             )
             return
 
@@ -417,12 +419,12 @@ class TelegramBot:
         watch  = [h for h in hits if h["tier"] == "📌"]
 
         def _row(h: dict) -> str:
-            sym     = h["symbol"].replace("USDT", "")
-            ftype   = h.get("fvg_type", "")
-            f_em    = "🟢" if "bull" in ftype else ("🔴" if "bear" in ftype else "🔵")
-            f_lbl   = "BullFVG" if "bull" in ftype else ("BearFVG" if "bear" in ftype else "iFVG")
-            pos     = "✅trong" if h.get("inside") else "🔔gần"
-            ab_mid  = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
+            sym    = h["symbol"].replace("USDT", "")
+            ftype  = h.get("fvg_type", "bear")
+            f_em   = "🔵" if "ifvg" in ftype else "🔴"
+            f_lbl  = "iFVG-Bear" if "ifvg" in ftype else "BearFVG"
+            pos    = "✅trong" if h.get("inside") else "🔔gần"
+            ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
             return (
                 f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`  {f_em}{f_lbl} {pos}\n"
                 f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`  "
@@ -431,9 +433,9 @@ class TelegramBot:
             )
 
         header = (
-            f"🔥 *FVG 4h + 15m SELL* — {len(hits)} token\n"
+            f"🔴 *Bear FVG 4h + 15m SELL* — {len(hits)} token\n"
             f"🔥 Strong:{len(strong)}  ⚡ Good:{len(good)}  📌 Watch:{len(watch)}\n"
-            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)_\n"
+            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)  →  Setup SHORT_\n"
             f"{'─'*30}\n"
         )
 
@@ -448,6 +450,74 @@ class TelegramBot:
                 sections.append(_row(h))
         if watch:
             sections.append(f"\n📌 *WATCH* — sell≥6 ({len(watch)})\n")
+            for h in watch:
+                sections.append(_row(h))
+
+        chunk = header
+        for line in sections:
+            if len(chunk) + len(line) > 3900:
+                await u.message.reply_text(chunk, parse_mode="Markdown")
+                chunk = line
+            else:
+                chunk += line
+        if chunk:
+            await u.message.reply_text(chunk, parse_mode="Markdown")
+
+    async def _fb(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """
+        /fb — Bull FVG 4h (buffer ±0.5%) + 15m BUY ≥ 6  →  setup LONG
+        Tier: 🔥 STRONG (buy≥9 + trong FVG) | ⚡ GOOD (buy≥8) | 📌 WATCH (buy≥6)
+        """
+        await u.message.reply_text(
+            "🟢 Đang quét *Bull FVG 4h + 15m BUY* toàn market (~60–90s)...",
+            parse_mode="Markdown"
+        )
+
+        hits = await self.scanner.scan_fb()
+
+        if not hits:
+            await u.message.reply_text(
+                "❌ Không tìm được token nào.\n"
+                "Thị trường chưa có setup Bull FVG 4h + BUY 15m lúc này."
+            )
+            return
+
+        strong = [h for h in hits if h["tier"] == "🔥"]
+        good   = [h for h in hits if h["tier"] == "⚡"]
+        watch  = [h for h in hits if h["tier"] == "📌"]
+
+        def _row(h: dict) -> str:
+            sym    = h["symbol"].replace("USDT", "")
+            ftype  = h.get("fvg_type", "bull")
+            f_em   = "🔵" if "ifvg" in ftype else "🟢"
+            f_lbl  = "iFVG-Bull" if "ifvg" in ftype else "BullFVG"
+            pos    = "✅trong" if h.get("inside") else "🔔gần"
+            ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
+            return (
+                f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`  {f_em}{f_lbl} {pos}\n"
+                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`  "
+                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  "
+                f"BUY:`{h['buy_score']}/11`  _{h['age_bars']}nến_\n"
+            )
+
+        header = (
+            f"🟢 *Bull FVG 4h + 15m BUY* — {len(hits)} token\n"
+            f"🔥 Strong:{len(strong)}  ⚡ Good:{len(good)}  📌 Watch:{len(watch)}\n"
+            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)  →  Setup LONG_\n"
+            f"{'─'*30}\n"
+        )
+
+        sections = []
+        if strong:
+            sections.append(f"🔥 *STRONG* — buy≥9 + trong FVG ({len(strong)})\n")
+            for h in strong:
+                sections.append(_row(h))
+        if good:
+            sections.append(f"\n⚡ *GOOD* — buy≥8 ({len(good)})\n")
+            for h in good:
+                sections.append(_row(h))
+        if watch:
+            sections.append(f"\n📌 *WATCH* — buy≥6 ({len(watch)})\n")
             for h in watch:
                 sections.append(_row(h))
 
