@@ -316,34 +316,67 @@ class Scanner:
                     if not fvg_hits:
                         return []
 
-                    # ── Bước 2: SELL score — pass đúng TF ─────────────────
-                    kwargs = self._score_kwargs(score_tf, df_score,   # [Fix 2]
-                                               fvg_tf,   df_fvg)
+                    # ── Bước 2: SELL score hiện tại ───────────────────────
+                    kwargs     = self._score_kwargs(score_tf, df_score,
+                                                   fvg_tf,   df_fvg)
                     result     = score_symbol(sym, **kwargs)
                     sell_score = result.ultra_sell_score
                     if sell_score < 6:
                         return []
 
-                    # ── Bước 3: FVG kháng cự gần giá nhất ────────────────
+                    # ── Bước 3: Signal freshness — score 3 nến trước ──────
+                    # So sánh score hiện tại vs 3 nến trước để phát hiện
+                    # signal vừa xuất hiện (tỉ lệ thắng cao hơn signal cũ)
+                    FRESH_LOOKBACK = 3
+                    prev_score = 0
+                    if len(df_score) > FRESH_LOOKBACK + 50:
+                        df_prev   = df_score.iloc[:-FRESH_LOOKBACK]
+                        kw_prev   = self._score_kwargs(score_tf, df_prev,
+                                                       fvg_tf,   df_fvg)
+                        prev_res  = score_symbol(sym, **kw_prev)
+                        prev_score = prev_res.ultra_sell_score
+
+                    # Fresh = score vừa bật lên (3 nến trước chưa đạt ngưỡng)
+                    signal_fresh = prev_score < 6
+
+                    # ── Bước 4: Nến xác nhận — nến 15m cuối bearish ───────
+                    last_c = df_score.iloc[-1]
+                    candle_confirms = float(last_c["close"]) < float(last_c["open"])
+
+                    # ── Bước 5: FVG kháng cự gần giá nhất ────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
                     tier = "🔥" if sell_score >= 9 and best["inside"] else (
                            "⚡" if sell_score >= 8 else "📌")
 
+                    # signal_status: FRESH > CONFIRM > ACTIVE
+                    if signal_fresh and candle_confirms:
+                        signal_status = "🎯FRESH+CNF"   # Tốt nhất: mới + xác nhận
+                    elif signal_fresh:
+                        signal_status = "🆕FRESH"        # Signal mới nhưng nến chưa đóng bearish
+                    elif candle_confirms:
+                        signal_status = "✅CONFIRM"      # Nến xác nhận nhưng signal không mới
+                    else:
+                        signal_status = "📊ACTIVE"       # Signal cũ, chưa có nến xác nhận
+
                     return [{
-                        "symbol":     sym,
-                        "cur_price":  cur,
-                        "fvg_type":   best.get("fvg_type", "bear"),
-                        "fvg_top":    best["top"],
-                        "fvg_bot":    best["bottom"],
-                        "fvg_mid":    round(mid, 6),
-                        "gap_pct":    best["gap_pct"],
-                        "dist_pct":   best["dist_pct"],
-                        "inside":     best["inside"],
-                        "age_bars":   best["age_bars"],
-                        "sell_score": sell_score,
-                        "tier":       tier,
+                        "symbol":         sym,
+                        "cur_price":      cur,
+                        "fvg_type":       best.get("fvg_type", "bear"),
+                        "fvg_top":        best["top"],
+                        "fvg_bot":        best["bottom"],
+                        "fvg_mid":        round(mid, 6),
+                        "gap_pct":        best["gap_pct"],
+                        "dist_pct":       best["dist_pct"],
+                        "inside":         best["inside"],
+                        "age_bars":       best["age_bars"],
+                        "sell_score":     sell_score,
+                        "prev_score":     prev_score,
+                        "signal_fresh":   signal_fresh,
+                        "candle_confirms":candle_confirms,
+                        "signal_status":  signal_status,
+                        "tier":           tier,
                     }]
                 except Exception as e:
                     logger.debug(f"scan_bear_fvg {sym}: {e}")
@@ -351,9 +384,18 @@ class Scanner:
 
         all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
         hits = [item for sublist in all_lists for item in sublist]
-        hits.sort(key=lambda x: (-x["sell_score"], x["dist_pct"]))
+        # Sort: FRESH+CNF > FRESH > CONFIRM > ACTIVE, rồi score cao, rồi gần FVG
+        STATUS_RANK = {"🎯FRESH+CNF": 0, "🆕FRESH": 1, "✅CONFIRM": 2, "📊ACTIVE": 3}
+        hits.sort(key=lambda x: (
+            STATUS_RANK.get(x["signal_status"], 9),
+            -x["sell_score"],
+            x["dist_pct"],
+        ))
+        fresh_cnt = sum(1 for h in hits if h["signal_fresh"])
+        cnf_cnt   = sum(1 for h in hits if h["candle_confirms"])
         logger.info(
             f"FT ({fvg_tf}) done: {len(hits)} tokens "
+            f"(fresh:{fresh_cnt} confirm:{cnf_cnt}) "
             f"(Bear FVG + {score_tf} SELL≥6)"
         )
         return hits
@@ -418,34 +460,63 @@ class Scanner:
                     if not fvg_hits:
                         return []
 
-                    # ── Bước 2: BUY score — pass đúng TF ──────────────────
-                    kwargs = self._score_kwargs(score_tf, df_score,   # [Fix 2]
-                                               fvg_tf,   df_fvg)
+                    # ── Bước 2: BUY score hiện tại ────────────────────────
+                    kwargs    = self._score_kwargs(score_tf, df_score,
+                                                  fvg_tf,   df_fvg)
                     result    = score_symbol(sym, **kwargs)
                     buy_score = result.ultra_buy_score
                     if buy_score < 6:
                         return []
 
-                    # ── Bước 3: FVG hỗ trợ gần giá nhất ──────────────────
+                    # ── Bước 3: Signal freshness — score 3 nến trước ──────
+                    FRESH_LOOKBACK = 3
+                    prev_score = 0
+                    if len(df_score) > FRESH_LOOKBACK + 50:
+                        df_prev   = df_score.iloc[:-FRESH_LOOKBACK]
+                        kw_prev   = self._score_kwargs(score_tf, df_prev,
+                                                       fvg_tf,   df_fvg)
+                        prev_res  = score_symbol(sym, **kw_prev)
+                        prev_score = prev_res.ultra_buy_score
+
+                    signal_fresh = prev_score < 6
+
+                    # ── Bước 4: Nến xác nhận — nến cuối bullish ───────────
+                    last_c = df_score.iloc[-1]
+                    candle_confirms = float(last_c["close"]) > float(last_c["open"])
+
+                    # ── Bước 5: FVG hỗ trợ gần giá nhất ──────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
                     tier = "🔥" if buy_score >= 9 and best["inside"] else (
                            "⚡" if buy_score >= 8 else "📌")
 
+                    if signal_fresh and candle_confirms:
+                        signal_status = "🎯FRESH+CNF"
+                    elif signal_fresh:
+                        signal_status = "🆕FRESH"
+                    elif candle_confirms:
+                        signal_status = "✅CONFIRM"
+                    else:
+                        signal_status = "📊ACTIVE"
+
                     return [{
-                        "symbol":    sym,
-                        "cur_price": cur,
-                        "fvg_type":  best.get("fvg_type", "bull"),
-                        "fvg_top":   best["top"],
-                        "fvg_bot":   best["bottom"],
-                        "fvg_mid":   round(mid, 6),
-                        "gap_pct":   best["gap_pct"],
-                        "dist_pct":  best["dist_pct"],
-                        "inside":    best["inside"],
-                        "age_bars":  best["age_bars"],
-                        "buy_score": buy_score,
-                        "tier":      tier,
+                        "symbol":          sym,
+                        "cur_price":       cur,
+                        "fvg_type":        best.get("fvg_type", "bull"),
+                        "fvg_top":         best["top"],
+                        "fvg_bot":         best["bottom"],
+                        "fvg_mid":         round(mid, 6),
+                        "gap_pct":         best["gap_pct"],
+                        "dist_pct":        best["dist_pct"],
+                        "inside":          best["inside"],
+                        "age_bars":        best["age_bars"],
+                        "buy_score":       buy_score,
+                        "prev_score":      prev_score,
+                        "signal_fresh":    signal_fresh,
+                        "candle_confirms": candle_confirms,
+                        "signal_status":   signal_status,
+                        "tier":            tier,
                     }]
                 except Exception as e:
                     logger.debug(f"scan_bull_fvg {sym}: {e}")
@@ -453,9 +524,17 @@ class Scanner:
 
         all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
         hits = [item for sublist in all_lists for item in sublist]
-        hits.sort(key=lambda x: (-x["buy_score"], x["dist_pct"]))
+        STATUS_RANK = {"🎯FRESH+CNF": 0, "🆕FRESH": 1, "✅CONFIRM": 2, "📊ACTIVE": 3}
+        hits.sort(key=lambda x: (
+            STATUS_RANK.get(x["signal_status"], 9),
+            -x["buy_score"],
+            x["dist_pct"],
+        ))
+        fresh_cnt = sum(1 for h in hits if h["signal_fresh"])
+        cnf_cnt   = sum(1 for h in hits if h["candle_confirms"])
         logger.info(
             f"FB ({fvg_tf}) done: {len(hits)} tokens "
+            f"(fresh:{fresh_cnt} confirm:{cnf_cnt}) "
             f"(Bull FVG + {score_tf} BUY≥6)"
         )
         return hits
