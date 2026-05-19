@@ -215,14 +215,18 @@ class Scanner:
 
     async def scan_ft(self) -> list[dict]:
         """
-        /ft — Quét toàn market, tìm token ĐỒNG THỜI thỏa:
-          1. Giá đang NẰM TRONG vùng FVG 4h (bull hoặc bear)
-          2. 15m ULTRA SELL score >= 8  (ultra_sell_score >= 8)
-        Chỉ fetch 4h + 15m cho mỗi token → nhanh.
-        Trả list[dict] sort theo ultra_sell_score giảm dần, sau đó dist_pct tăng dần.
+        /ft — Quét toàn market, tìm token thỏa:
+          1. Giá đang TRONG hoặc GẦN vùng FVG 4h (buffer ±0.5% quanh vùng)
+          2. 15m ULTRA SELL score >= 6
+
+        Kết quả chia 3 tier:
+          🔥 STRONG : sell >= 9  +  trong FVG (dist=0)
+          ⚡ GOOD   : sell >= 8  +  trong hoặc gần FVG
+          📌 WATCH  : sell >= 6  +  trong hoặc gần FVG
+        Sort: sell_score cao → dist_pct gần nhất.
         """
         symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
-        logger.info(f"FT scan: {len(symbols)} symbols (FVG-4h + 15m SELL)")
+        logger.info(f"FT scan: {len(symbols)} symbols (FVG-4h + 15m SELL≥6)")
 
         sem = asyncio.Semaphore(CONCURRENCY)
 
@@ -238,23 +242,33 @@ class Scanner:
                     if df15 is None or len(df15) < 50:
                         return []
 
-                    # ── Bước 1: FVG 4h ────────────────────────────────────
-                    fvg_res  = detect_fvg(df4h, min_gap_pct=0.0, max_keep=10)
-                    cur      = fvg_res["cur_price"]
+                    # ── Bước 1: FVG 4h — dùng buffer ±0.5% ───────────────
+                    fvg_res = detect_fvg(df4h, min_gap_pct=0.0, max_keep=15)
+                    cur     = fvg_res["cur_price"]
                     if cur <= 0:
                         return []
 
+                    BUFFER = 0.005  # 0.5% quanh vùng FVG
                     fvg_hits = []
-                    for fvg in fvg_res["bull_fvgs"] + fvg_res["bear_fvgs"]:
-                        if fvg["bottom"] <= cur <= fvg["top"]:
-                            fvg_hits.append(fvg)
+                    for fvg in fvg_res["bull_fvgs"] + fvg_res["bear_fvgs"] + fvg_res["ifvgs"]:
+                        top_buf = fvg["top"]  * (1 + BUFFER)
+                        bot_buf = fvg["bottom"] * (1 - BUFFER)
+                        if bot_buf <= cur <= top_buf:
+                            mid      = (fvg["top"] + fvg["bottom"]) / 2
+                            dist_pct = abs(cur - mid) / mid * 100 if mid > 0 else 0
+                            inside   = fvg["bottom"] <= cur <= fvg["top"]
+                            ftype    = fvg.get("status", "active")
+                            if ftype == "active":
+                                # phân loại bull/bear theo vị trí trong df
+                                ftype = "bull" if fvg in fvg_res["bull_fvgs"] else (
+                                        "bear" if fvg in fvg_res["bear_fvgs"] else fvg.get("status","ifvg"))
+                            fvg_hits.append({**fvg, "dist_pct": round(dist_pct, 2),
+                                             "inside": inside, "fvg_type": ftype})
 
                     if not fvg_hits:
                         return []
 
                     # ── Bước 2: 15m ULTRA SELL score ──────────────────────
-                    # Tính nhanh ultra score 15m: dùng score_symbol nhẹ
-                    # Truyền df15 cho cả 5m, 15m, bỏ qua các TF khác (None)
                     result = score_symbol(
                         sym,
                         df_5m  = df15,
@@ -266,28 +280,31 @@ class Scanner:
                     )
 
                     sell_score = result.ultra_sell_score
-                    if sell_score < 8:
+                    if sell_score < 6:
                         return []
 
-                    # ── Bước 3: Build hit records ──────────────────────────
-                    out = []
-                    for fvg in fvg_hits:
-                        mid      = (fvg["top"] + fvg["bottom"]) / 2
-                        dist_pct = abs(cur - mid) / mid * 100 if mid > 0 else 0
-                        out.append({
-                            "symbol":      sym,
-                            "cur_price":   cur,
-                            "fvg_type":    fvg["fvg_type"] if "fvg_type" in fvg else ("bull" if cur > fvg["bottom"] else "bear"),
-                            "fvg_top":     fvg["top"],
-                            "fvg_bot":     fvg["bottom"],
-                            "fvg_mid":     round(mid, 6),
-                            "gap_pct":     fvg["gap_pct"],
-                            "dist_pct":    round(dist_pct, 2),
-                            "age_bars":    fvg["age_bars"],
-                            "sell_score":  sell_score,
-                            "ultra_verdict": result.ultra_sell_score,
-                        })
-                    return out
+                    # ── Bước 3: Build hit — lấy FVG gần nhất ─────────────
+                    fvg_hits.sort(key=lambda x: x["dist_pct"])
+                    best = fvg_hits[0]
+                    mid  = (best["top"] + best["bottom"]) / 2
+
+                    tier = "🔥" if sell_score >= 9 and best["inside"] else (
+                           "⚡" if sell_score >= 8 else "📌")
+
+                    return [{
+                        "symbol":    sym,
+                        "cur_price": cur,
+                        "fvg_type":  best.get("fvg_type", ""),
+                        "fvg_top":   best["top"],
+                        "fvg_bot":   best["bottom"],
+                        "fvg_mid":   round(mid, 6),
+                        "gap_pct":   best["gap_pct"],
+                        "dist_pct":  best["dist_pct"],
+                        "inside":    best["inside"],
+                        "age_bars":  best["age_bars"],
+                        "sell_score": sell_score,
+                        "tier":      tier,
+                    }]
 
                 except Exception as e:
                     logger.debug(f"scan_ft {sym}: {e}")
@@ -295,8 +312,6 @@ class Scanner:
 
         all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
         hits = [item for sublist in all_lists for item in sublist]
-
-        # Sort: sell_score cao trước, cùng score thì gần mid FVG nhất trước
         hits.sort(key=lambda x: (-x["sell_score"], x["dist_pct"]))
-        logger.info(f"FT scan done: {len(hits)} tokens (FVG-4h + 15m SELL≥8)")
+        logger.info(f"FT scan done: {len(hits)} tokens (FVG-4h + SELL≥6)")
         return hits
