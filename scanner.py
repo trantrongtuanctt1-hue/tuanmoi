@@ -217,19 +217,61 @@ class Scanner:
     # CORE ENGINE — Bear/Bull FVG scan với bất kỳ TF nào
     # ──────────────────────────────────────────────────────────────────────
 
+    # Buffer scale theo TF — FVG 1D rộng hơn nhiều so với 1h
+    _FVG_BUFFER = {"1h": 0.003, "4h": 0.005, "1d": 0.010}
+
+    # Mapping score_tf → kwargs đúng cho score_symbol
+    # Chỉ pass df vào đúng slot TF, còn lại None
+    @staticmethod
+    def _score_kwargs(score_tf: str, df_score, fvg_tf: str, df_fvg) -> dict:
+        """
+        Tránh bug pass df_fvg vào df_4h khi fvg_tf != 4h.
+        Mỗi slot chỉ nhận df đúng timeframe của nó.
+        """
+        kwargs = dict(df_5m=None, df_15m=None, df_30m=None,
+                      df_1h=None, df_4h=None, df_1d=None)
+        # Điền df_score vào đúng slot score_tf
+        slot_score = {
+            "5m": "df_5m", "15m": "df_15m", "30m": "df_30m",
+            "1h": "df_1h", "4h":  "df_4h",  "1d":  "df_1d",
+        }.get(score_tf)
+        if slot_score:
+            kwargs[slot_score] = df_score
+            # score_symbol cần ít nhất df_5m hoặc df_15m làm base
+            if slot_score not in ("df_5m", "df_15m"):
+                kwargs["df_5m"]  = df_score
+                kwargs["df_15m"] = df_score
+
+        # Điền df_fvg vào đúng slot fvg_tf (nếu khác slot score)
+        slot_fvg = {
+            "5m": "df_5m", "15m": "df_15m", "30m": "df_30m",
+            "1h": "df_1h", "4h":  "df_4h",  "1d":  "df_1d",
+        }.get(fvg_tf)
+        if slot_fvg and slot_fvg != slot_score:
+            kwargs[slot_fvg] = df_fvg
+
+        return kwargs
+
     async def _scan_bear_fvg(self, fvg_tf: str, score_tf: str) -> list[dict]:
         """
-        Core engine cho /ft, /ft1h, /ft1d.
-        fvg_tf  : TF để detect FVG (ví dụ "4h", "1h", "1d")
-        score_tf: TF để tính ULTRA SELL score (ví dụ "15m", "1h")
-        Chỉ lấy Bear FVG + iFVG bear → setup SHORT.
+        Core engine cho /ft, /ft1h, /ft1d — setup SHORT.
+
+        Logic SMC đúng:
+          • Bear FVG   : vùng kháng cự gốc (giá rớt mạnh tạo ra)
+          • iFVG bull  : Bull FVG đã bị giá phá xuống → đổi vai trò thành kháng cự
+
+        Fix so với phiên bản cũ:
+          [1] iFVG đúng vai trò  → lấy ifvg_bull thay vì ifvg_bear
+          [2] df_4h pass đúng TF → dùng _score_kwargs()
+          [3] Buffer scale theo TF → _FVG_BUFFER[fvg_tf]
         """
         symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
         logger.info(
             f"FT scan: {len(symbols)} symbols "
             f"(Bear FVG-{fvg_tf} + {score_tf} SELL≥6)"
         )
-        sem = asyncio.Semaphore(CONCURRENCY)
+        BUFFER = self._FVG_BUFFER.get(fvg_tf, 0.005)   # [Fix 3]
+        sem    = asyncio.Semaphore(CONCURRENCY)
 
         async def _check_one(sym: str) -> list[dict]:
             async with sem:
@@ -243,22 +285,23 @@ class Scanner:
                     if df_score is None or len(df_score) < 50:
                         return []
 
-                    # ── Bước 1: Bear FVG — buffer ±0.5% ──────────────────
+                    # ── Bước 1: Chọn đúng FVG kháng cự ───────────────────
                     fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
                     cur     = fvg_res["cur_price"]
                     if cur <= 0:
                         return []
 
+                    # [Fix 1] Bear FVG gốc  +  iFVG bull (bull FVG bị phá xuống
+                    #         → giờ đóng vai kháng cự)
                     bear_fvgs = fvg_res["bear_fvgs"]
-                    ifvg_bear = [f for f in fvg_res["ifvgs"]
-                                 if f.get("status", "") == "ifvg_bear"]
+                    ifvg_bull_as_res = [f for f in fvg_res["ifvgs"]
+                                        if f.get("status", "") == "ifvg_bull"]
                     candidates = [(f, "bear")      for f in bear_fvgs] + \
-                                 [(f, "ifvg_bear") for f in ifvg_bear]
+                                 [(f, "ifvg_bull") for f in ifvg_bull_as_res]
 
-                    BUFFER   = 0.005
                     fvg_hits = []
                     for fvg, ftype in candidates:
-                        top_buf = fvg["top"]    * (1 + BUFFER)
+                        top_buf = fvg["top"]    * (1 + BUFFER)   # [Fix 3]
                         bot_buf = fvg["bottom"] * (1 - BUFFER)
                         if bot_buf <= cur <= top_buf:
                             mid      = (fvg["top"] + fvg["bottom"]) / 2
@@ -269,21 +312,15 @@ class Scanner:
                     if not fvg_hits:
                         return []
 
-                    # ── Bước 2: ULTRA SELL score trên score_tf ────────────
-                    result = score_symbol(
-                        sym,
-                        df_5m  = df_score,
-                        df_15m = df_score,
-                        df_1h  = None,
-                        df_30m = None,
-                        df_4h  = df_fvg,
-                        df_1d  = None,
-                    )
+                    # ── Bước 2: SELL score — pass đúng TF ─────────────────
+                    kwargs = self._score_kwargs(score_tf, df_score,   # [Fix 2]
+                                               fvg_tf,   df_fvg)
+                    result     = score_symbol(sym, **kwargs)
                     sell_score = result.ultra_sell_score
                     if sell_score < 6:
                         return []
 
-                    # ── Bước 3: Bear FVG gần giá nhất ────────────────────
+                    # ── Bước 3: FVG kháng cự gần giá nhất ────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
@@ -319,17 +356,24 @@ class Scanner:
 
     async def _scan_bull_fvg(self, fvg_tf: str, score_tf: str) -> list[dict]:
         """
-        Core engine cho /fb, /fb1h, /fb1d.
-        fvg_tf  : TF để detect FVG (ví dụ "4h", "1h", "1d")
-        score_tf: TF để tính ULTRA BUY score (ví dụ "15m", "1h")
-        Chỉ lấy Bull FVG + iFVG bull → setup LONG.
+        Core engine cho /fb, /fb1h, /fb1d — setup LONG.
+
+        Logic SMC đúng:
+          • Bull FVG   : vùng hỗ trợ gốc (giá tăng mạnh tạo ra)
+          • iFVG bear  : Bear FVG đã bị giá phá lên → đổi vai trò thành hỗ trợ
+
+        Fix so với phiên bản cũ:
+          [1] iFVG đúng vai trò  → lấy ifvg_bear thay vì ifvg_bull
+          [2] df_4h pass đúng TF → dùng _score_kwargs()
+          [3] Buffer scale theo TF → _FVG_BUFFER[fvg_tf]
         """
         symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
         logger.info(
             f"FB scan: {len(symbols)} symbols "
             f"(Bull FVG-{fvg_tf} + {score_tf} BUY≥6)"
         )
-        sem = asyncio.Semaphore(CONCURRENCY)
+        BUFFER = self._FVG_BUFFER.get(fvg_tf, 0.005)   # [Fix 3]
+        sem    = asyncio.Semaphore(CONCURRENCY)
 
         async def _check_one(sym: str) -> list[dict]:
             async with sem:
@@ -343,22 +387,23 @@ class Scanner:
                     if df_score is None or len(df_score) < 50:
                         return []
 
-                    # ── Bước 1: Bull FVG — buffer ±0.5% ──────────────────
+                    # ── Bước 1: Chọn đúng FVG hỗ trợ ─────────────────────
                     fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
                     cur     = fvg_res["cur_price"]
                     if cur <= 0:
                         return []
 
+                    # [Fix 1] Bull FVG gốc  +  iFVG bear (bear FVG bị phá lên
+                    #         → giờ đóng vai hỗ trợ)
                     bull_fvgs = fvg_res["bull_fvgs"]
-                    ifvg_bull = [f for f in fvg_res["ifvgs"]
-                                 if f.get("status", "") == "ifvg_bull"]
+                    ifvg_bear_as_sup = [f for f in fvg_res["ifvgs"]
+                                        if f.get("status", "") == "ifvg_bear"]
                     candidates = [(f, "bull")      for f in bull_fvgs] + \
-                                 [(f, "ifvg_bull") for f in ifvg_bull]
+                                 [(f, "ifvg_bear") for f in ifvg_bear_as_sup]
 
-                    BUFFER   = 0.005
                     fvg_hits = []
                     for fvg, ftype in candidates:
-                        top_buf = fvg["top"]    * (1 + BUFFER)
+                        top_buf = fvg["top"]    * (1 + BUFFER)   # [Fix 3]
                         bot_buf = fvg["bottom"] * (1 - BUFFER)
                         if bot_buf <= cur <= top_buf:
                             mid      = (fvg["top"] + fvg["bottom"]) / 2
@@ -369,21 +414,15 @@ class Scanner:
                     if not fvg_hits:
                         return []
 
-                    # ── Bước 2: ULTRA BUY score trên score_tf ─────────────
-                    result = score_symbol(
-                        sym,
-                        df_5m  = df_score,
-                        df_15m = df_score,
-                        df_1h  = None,
-                        df_30m = None,
-                        df_4h  = df_fvg,
-                        df_1d  = None,
-                    )
+                    # ── Bước 2: BUY score — pass đúng TF ──────────────────
+                    kwargs = self._score_kwargs(score_tf, df_score,   # [Fix 2]
+                                               fvg_tf,   df_fvg)
+                    result    = score_symbol(sym, **kwargs)
                     buy_score = result.ultra_buy_score
                     if buy_score < 6:
                         return []
 
-                    # ── Bước 3: Bull FVG gần giá nhất ────────────────────
+                    # ── Bước 3: FVG hỗ trợ gần giá nhất ──────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
