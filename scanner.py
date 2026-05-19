@@ -12,7 +12,11 @@ import time
 from typing import Optional
 
 from fetcher import BybitFetcher
-from signals import SignalResult, score_symbol, detect_fvg
+from signals import (
+    SignalResult, score_symbol, detect_fvg,
+    detect_liquidity_sweep, detect_choch,
+    detect_vol_spike_at_fvg, calc_fvg_rr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -343,15 +347,39 @@ class Scanner:
                     last_c = df_score.iloc[-1]
                     candle_confirms = float(last_c["close"]) < float(last_c["open"])
 
-                    # ── Bước 5: FVG kháng cự gần giá nhất ────────────────
+                    # ── Chọn FVG kháng cự gần giá nhất ───────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
                     tier = "🔥" if sell_score >= 9 and best["inside"] else (
                            "⚡" if sell_score >= 8 else "📌")
 
-                    # signal_status: FRESH > CONFIRM > ACTIVE
-                    if signal_fresh and candle_confirms:
+                    # ── Bước 5: Liquidity Sweep ────────────────────────────
+                    sweep_res  = detect_liquidity_sweep(df_score)
+                    liq_swept  = sweep_res["swept"]
+                    # Chỉ tính high sweep (quét liq trên → SHORT hợp lý hơn)
+                    liq_valid  = liq_swept and sweep_res["sweep_type"] == "high"
+
+                    # ── Bước 6: CHoCH ──────────────────────────────────────
+                    choch_res  = detect_choch(df_score)
+                    choch_ok   = (choch_res["choch_detected"]
+                                  and choch_res["choch_type"] == "bear")
+
+                    # ── Bước 7: Volume spike tại FVG ───────────────────────
+                    vol_res    = detect_vol_spike_at_fvg(
+                        df_score, best["top"], best["bottom"])
+                    vol_spike  = vol_res["vol_spike"]
+
+                    # ── Bước 8: RR tự động ─────────────────────────────────
+                    rr_res     = calc_fvg_rr(
+                        df_score, cur, best["top"], best["bottom"], "sell")
+                    rr_ok      = rr_res["rr_ok"]
+
+                    # ── Signal status (SNIPER tier mới) ────────────────────
+                    # SNIPER: Sweep + CHoCH + Fresh + Confirm → entry chất lượng nhất
+                    if liq_valid and choch_ok and signal_fresh and candle_confirms:
+                        signal_status = "🎰SNIPER"
+                    elif signal_fresh and candle_confirms:
                         signal_status = "🎯FRESH+CNF"   # Tốt nhất: mới + xác nhận
                     elif signal_fresh:
                         signal_status = "🆕FRESH"        # Signal mới nhưng nến chưa đóng bearish
@@ -361,22 +389,41 @@ class Scanner:
                         signal_status = "📊ACTIVE"       # Signal cũ, chưa có nến xác nhận
 
                     return [{
-                        "symbol":         sym,
-                        "cur_price":      cur,
-                        "fvg_type":       best.get("fvg_type", "bear"),
-                        "fvg_top":        best["top"],
-                        "fvg_bot":        best["bottom"],
-                        "fvg_mid":        round(mid, 6),
-                        "gap_pct":        best["gap_pct"],
-                        "dist_pct":       best["dist_pct"],
-                        "inside":         best["inside"],
-                        "age_bars":       best["age_bars"],
-                        "sell_score":     sell_score,
-                        "prev_score":     prev_score,
-                        "signal_fresh":   signal_fresh,
-                        "candle_confirms":candle_confirms,
-                        "signal_status":  signal_status,
-                        "tier":           tier,
+                        "symbol":          sym,
+                        "cur_price":       cur,
+                        "fvg_type":        best.get("fvg_type", "bear"),
+                        "fvg_top":         best["top"],
+                        "fvg_bot":         best["bottom"],
+                        "fvg_mid":         round(mid, 6),
+                        "gap_pct":         best["gap_pct"],
+                        "dist_pct":        best["dist_pct"],
+                        "inside":          best["inside"],
+                        "age_bars":        best["age_bars"],
+                        "sell_score":      sell_score,
+                        "prev_score":      prev_score,
+                        "signal_fresh":    signal_fresh,
+                        "candle_confirms": candle_confirms,
+                        "signal_status":   signal_status,
+                        "tier":            tier,
+                        # Bước 5 — Liquidity Sweep
+                        "liq_swept":       liq_valid,
+                        "liq_eq_type":     sweep_res.get("eq_type", ""),
+                        "liq_level":       sweep_res.get("sweep_level", 0.0),
+                        "liq_bars_ago":    sweep_res.get("bars_ago", 0),
+                        # Bước 6 — CHoCH
+                        "choch_ok":        choch_ok,
+                        "choch_level":     choch_res.get("choch_level", 0.0),
+                        "choch_bars_ago":  choch_res.get("bars_ago", 0),
+                        # Bước 7 — Volume
+                        "vol_spike":       vol_spike,
+                        "vol_ratio":       vol_res.get("vol_ratio", 1.0),
+                        # Bước 8 — RR
+                        "rr":              rr_res.get("rr", 0.0),
+                        "rr_ok":           rr_ok,
+                        "sl_price":        rr_res.get("sl_price", 0.0),
+                        "tp_price":        rr_res.get("tp_price", 0.0),
+                        "sl_pct":          rr_res.get("sl_pct", 0.0),
+                        "tp_pct":          rr_res.get("tp_pct", 0.0),
                     }]
                 except Exception as e:
                     logger.debug(f"scan_bear_fvg {sym}: {e}")
@@ -385,7 +432,7 @@ class Scanner:
         all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
         hits = [item for sublist in all_lists for item in sublist]
         # Sort: FRESH+CNF > FRESH > CONFIRM > ACTIVE, rồi score cao, rồi gần FVG
-        STATUS_RANK = {"🎯FRESH+CNF": 0, "🆕FRESH": 1, "✅CONFIRM": 2, "📊ACTIVE": 3}
+        STATUS_RANK = {"🎰SNIPER": 0, "🎯FRESH+CNF": 1, "🆕FRESH": 2, "✅CONFIRM": 3, "📊ACTIVE": 4}
         hits.sort(key=lambda x: (
             STATUS_RANK.get(x["signal_status"], 9),
             -x["sell_score"],
@@ -484,14 +531,38 @@ class Scanner:
                     last_c = df_score.iloc[-1]
                     candle_confirms = float(last_c["close"]) > float(last_c["open"])
 
-                    # ── Bước 5: FVG hỗ trợ gần giá nhất ──────────────────
+                    # ── Chọn FVG hỗ trợ gần giá nhất ─────────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
                     tier = "🔥" if buy_score >= 9 and best["inside"] else (
                            "⚡" if buy_score >= 8 else "📌")
 
-                    if signal_fresh and candle_confirms:
+                    # ── Bước 5: Liquidity Sweep ────────────────────────────
+                    sweep_res = detect_liquidity_sweep(df_score)
+                    liq_swept = sweep_res["swept"]
+                    # Low sweep → giá quét liq dưới trước khi tăng (hợp lý cho LONG)
+                    liq_valid = liq_swept and sweep_res["sweep_type"] == "low"
+
+                    # ── Bước 6: CHoCH ──────────────────────────────────────
+                    choch_res = detect_choch(df_score)
+                    choch_ok  = (choch_res["choch_detected"]
+                                 and choch_res["choch_type"] == "bull")
+
+                    # ── Bước 7: Volume spike tại FVG ───────────────────────
+                    vol_res   = detect_vol_spike_at_fvg(
+                        df_score, best["top"], best["bottom"])
+                    vol_spike = vol_res["vol_spike"]
+
+                    # ── Bước 8: RR tự động ─────────────────────────────────
+                    rr_res    = calc_fvg_rr(
+                        df_score, cur, best["top"], best["bottom"], "buy")
+                    rr_ok     = rr_res["rr_ok"]
+
+                    # ── Signal status ───────────────────────────────────────
+                    if liq_valid and choch_ok and signal_fresh and candle_confirms:
+                        signal_status = "🎰SNIPER"
+                    elif signal_fresh and candle_confirms:
                         signal_status = "🎯FRESH+CNF"
                     elif signal_fresh:
                         signal_status = "🆕FRESH"
@@ -517,6 +588,25 @@ class Scanner:
                         "candle_confirms": candle_confirms,
                         "signal_status":   signal_status,
                         "tier":            tier,
+                        # Bước 5 — Liquidity Sweep
+                        "liq_swept":       liq_valid,
+                        "liq_eq_type":     sweep_res.get("eq_type", ""),
+                        "liq_level":       sweep_res.get("sweep_level", 0.0),
+                        "liq_bars_ago":    sweep_res.get("bars_ago", 0),
+                        # Bước 6 — CHoCH
+                        "choch_ok":        choch_ok,
+                        "choch_level":     choch_res.get("choch_level", 0.0),
+                        "choch_bars_ago":  choch_res.get("bars_ago", 0),
+                        # Bước 7 — Volume
+                        "vol_spike":       vol_spike,
+                        "vol_ratio":       vol_res.get("vol_ratio", 1.0),
+                        # Bước 8 — RR
+                        "rr":              rr_res.get("rr", 0.0),
+                        "rr_ok":           rr_ok,
+                        "sl_price":        rr_res.get("sl_price", 0.0),
+                        "tp_price":        rr_res.get("tp_price", 0.0),
+                        "sl_pct":          rr_res.get("sl_pct", 0.0),
+                        "tp_pct":          rr_res.get("tp_pct", 0.0),
                     }]
                 except Exception as e:
                     logger.debug(f"scan_bull_fvg {sym}: {e}")
@@ -524,7 +614,7 @@ class Scanner:
 
         all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
         hits = [item for sublist in all_lists for item in sublist]
-        STATUS_RANK = {"🎯FRESH+CNF": 0, "🆕FRESH": 1, "✅CONFIRM": 2, "📊ACTIVE": 3}
+        STATUS_RANK = {"🎰SNIPER": 0, "🎯FRESH+CNF": 1, "🆕FRESH": 2, "✅CONFIRM": 3, "📊ACTIVE": 4}
         hits.sort(key=lambda x: (
             STATUS_RANK.get(x["signal_status"], 9),
             -x["buy_score"],
