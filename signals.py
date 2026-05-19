@@ -1083,6 +1083,308 @@ def score_symbol(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# NEW ① LIQUIDITY SWEEP DETECTOR
+# Phát hiện giá vừa quét equal highs/lows hoặc swing high/low trước khi
+# chạm FVG — điều kiện SMC entry chất lượng cao nhất
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_liquidity_sweep(
+    df:           pd.DataFrame,
+    lookback:     int   = 30,
+    eq_tol:       float = 0.002,   # 0.2% — ngưỡng coi là "equal" high/low
+    sweep_bars:   int   = 5,       # kiểm tra trong N nến gần nhất
+) -> dict:
+    """
+    Phát hiện Liquidity Sweep: wick vượt qua level rồi close quay lại.
+
+    HIGH sweep (bearish): high > EQH/SwingH  AND  close < level  → giá quét liq trên
+    LOW  sweep (bullish): low  < EQL/SwingL  AND  close > level  → giá quét liq dưới
+
+    Trả dict:
+      swept       : bool
+      sweep_type  : "high" | "low" | ""
+      sweep_level : float
+      bars_ago    : int
+      eq_type     : "EQH" | "EQL" | "SwingH" | "SwingL" | ""
+    """
+    empty = {"swept": False, "sweep_type": "", "sweep_level": 0.0,
+             "bars_ago": 0, "eq_type": ""}
+
+    if df is None or len(df) < lookback + sweep_bars + 5:
+        return empty
+
+    highs  = df["high"].values
+    lows   = df["low"].values
+    closes = df["close"].values
+    n      = len(df)
+
+    # Reference window: loại trừ sweep_bars cuối để tìm liquidity levels
+    ref_end   = n - sweep_bars
+    ref_start = max(0, ref_end - lookback)
+    rh = highs[ref_start:ref_end]
+    rl = lows[ref_start:ref_end]
+
+    # ── Equal Highs / Equal Lows ──────────────────────────────────────────
+    eq_highs, eq_lows = [], []
+    for i in range(len(rh) - 1):
+        for j in range(i + 1, min(i + 8, len(rh))):   # chỉ so 7 nến gần
+            if rh[i] > 0 and abs(rh[i] - rh[j]) / rh[i] <= eq_tol:
+                eq_highs.append((rh[i] + rh[j]) / 2)
+            if rl[i] > 0 and abs(rl[i] - rl[j]) / rl[i] <= eq_tol:
+                eq_lows.append((rl[i] + rl[j]) / 2)
+
+    # ── Swing Highs / Lows (local extremes, window 3) ─────────────────────
+    swing_highs, swing_lows = [], []
+    for i in range(2, len(rh) - 2):
+        if rh[i] > rh[i-1] and rh[i] > rh[i+1] and rh[i] > rh[i-2] and rh[i] > rh[i+2]:
+            swing_highs.append(float(rh[i]))
+        if rl[i] < rl[i-1] and rl[i] < rl[i+1] and rl[i] < rl[i-2] and rl[i] < rl[i+2]:
+            swing_lows.append(float(rl[i]))
+
+    best: Optional[dict] = None
+
+    # ── Kiểm tra sweep trong sweep_bars nến gần nhất ──────────────────────
+    for bars_back in range(sweep_bars):
+        idx = n - 1 - bars_back
+        h, lo, c = float(highs[idx]), float(lows[idx]), float(closes[idx])
+        bars_ago  = bars_back
+
+        # HIGH sweep: wick lên trên level, close dưới
+        for level in set(eq_highs + swing_highs):
+            if level <= 0:
+                continue
+            if h > level and c < level:
+                eq_t = "EQH" if level in eq_highs else "SwingH"
+                if best is None or bars_ago < best["bars_ago"]:
+                    best = {"swept": True, "sweep_type": "high",
+                            "sweep_level": round(level, 6),
+                            "bars_ago": bars_ago, "eq_type": eq_t}
+
+        # LOW sweep: wick xuống dưới level, close trên
+        for level in set(eq_lows + swing_lows):
+            if level <= 0:
+                continue
+            if lo < level and c > level:
+                eq_t = "EQL" if level in eq_lows else "SwingL"
+                if best is None or bars_ago < best["bars_ago"]:
+                    best = {"swept": True, "sweep_type": "low",
+                            "sweep_level": round(level, 6),
+                            "bars_ago": bars_ago, "eq_type": eq_t}
+
+    return best if best else empty
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW ② CHoCH DETECTOR (Change of Character)
+# Xác nhận đảo chiều sớm nhất — dấu hiệu smart money đang hấp thụ
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_choch(
+    df:        pd.DataFrame,
+    swing_len: int = 5,    # số nến mỗi bên để xác định swing
+    lookback:  int = 40,
+    max_bars:  int = 10,   # CHoCH chỉ tính nếu xảy ra trong max_bars gần nhất
+) -> dict:
+    """
+    CHoCH Bear: trong uptrend (HH-HL), close phá xuống dưới swing low gần nhất
+    CHoCH Bull: trong downtrend (LL-LH), close phá lên trên swing high gần nhất
+
+    Trả dict:
+      choch_detected : bool
+      choch_type     : "bull" | "bear" | ""
+      choch_level    : float
+      bars_ago       : int
+    """
+    empty = {"choch_detected": False, "choch_type": "", "choch_level": 0.0, "bars_ago": 0}
+
+    if df is None or len(df) < lookback + swing_len * 2 + 2:
+        return empty
+
+    df_w   = df.tail(lookback + swing_len * 2)
+    highs  = df_w["high"].values
+    lows   = df_w["low"].values
+    closes = df_w["close"].values
+    n      = len(closes)
+
+    # Tìm swing highs/lows (dùng pivot: N nến mỗi bên)
+    sh_idx, sl_idx = [], []
+    for i in range(swing_len, n - swing_len):
+        win_h = highs[i - swing_len: i + swing_len + 1]
+        win_l = lows[i - swing_len:  i + swing_len + 1]
+        if highs[i] == win_h.max():
+            sh_idx.append(i)
+        if lows[i] == win_l.min():
+            sl_idx.append(i)
+
+    cur_close = closes[-1]
+
+    # CHoCH Bull: close[-1] > last swing high (breakout qua đỉnh trong downtrend)
+    recent_sh = [i for i in sh_idx if 0 < (n - 1 - i) <= max_bars]
+    if recent_sh:
+        last_sh    = recent_sh[-1]
+        level      = float(highs[last_sh])
+        bars_ago   = n - 1 - last_sh
+        if cur_close > level:
+            return {"choch_detected": True, "choch_type": "bull",
+                    "choch_level": round(level, 6), "bars_ago": bars_ago}
+
+    # CHoCH Bear: close[-1] < last swing low (breakdown qua đáy trong uptrend)
+    recent_sl = [i for i in sl_idx if 0 < (n - 1 - i) <= max_bars]
+    if recent_sl:
+        last_sl  = recent_sl[-1]
+        level    = float(lows[last_sl])
+        bars_ago = n - 1 - last_sl
+        if cur_close < level:
+            return {"choch_detected": True, "choch_type": "bear",
+                    "choch_level": round(level, 6), "bars_ago": bars_ago}
+
+    return empty
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW ③ VOLUME SPIKE AT FVG
+# Kiểm tra volume đột biến tại nến đang chạm / vừa vào vùng FVG
+# ══════════════════════════════════════════════════════════════════════════
+
+def detect_vol_spike_at_fvg(
+    df:          pd.DataFrame,
+    fvg_top:     float,
+    fvg_bot:     float,
+    vol_avg_len: int   = 20,
+    spike_mult:  float = 1.5,   # volume > 1.5× avg → spike
+    check_bars:  int   = 3,
+) -> dict:
+    """
+    Tìm nến trong check_bars gần nhất thỏa mãn:
+      1. Nến chạm (overlap) vùng FVG
+      2. Volume ≥ spike_mult × avg volume
+
+    Trả dict:
+      vol_spike : bool
+      vol_ratio : float  (vol nến chạm / avg vol)
+      spike_bar : int    (0 = nến hiện tại, 1 = nến trước, ...)
+    """
+    result = {"vol_spike": False, "vol_ratio": 1.0, "spike_bar": 0}
+
+    if df is None or len(df) < vol_avg_len + check_bars + 2:
+        return result
+
+    vols   = df["volume"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+
+    # Avg volume: cửa sổ trước check_bars nến gần nhất
+    avg_vol = float(np.mean(vols[-(vol_avg_len + check_bars):-check_bars]))
+    if avg_vol <= 0:
+        return result
+
+    best_ratio = 0.0
+    best_bar   = 0
+    found      = False
+
+    for i in range(check_bars):
+        idx = -(i + 1)
+        h, lo, v = float(highs[idx]), float(lows[idx]), float(vols[idx])
+        if h >= fvg_bot and lo <= fvg_top:       # nến overlap với FVG
+            ratio = v / avg_vol
+            if ratio >= spike_mult and ratio > best_ratio:
+                best_ratio = ratio
+                best_bar   = i
+                found      = True
+
+    if found:
+        return {"vol_spike": True, "vol_ratio": round(best_ratio, 2), "spike_bar": best_bar}
+
+    # Không spike — trả vol_ratio của nến gần nhất để hiển thị
+    result["vol_ratio"] = round(float(vols[-1]) / avg_vol, 2)
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NEW ④ RR AUTO CALCULATOR
+# SL đặt ngoài FVG, TP = nearest liquidity (swing high/low)
+# Filter tự động nếu RR < 1.5
+# ══════════════════════════════════════════════════════════════════════════
+
+def calc_fvg_rr(
+    df:         pd.DataFrame,
+    cur_price:  float,
+    fvg_top:    float,
+    fvg_bot:    float,
+    direction:  str,             # "sell" | "buy"
+    sl_buffer:  float = 0.002,  # 0.2% ngoài FVG
+    swing_len:  int   = 5,
+    lookback:   int   = 50,
+    min_rr:     float = 1.5,
+) -> dict:
+    """
+    SHORT: SL = fvg_top × (1 + sl_buffer)
+           TP = nearest swing low dưới cur_price
+    LONG:  SL = fvg_bot × (1 - sl_buffer)
+           TP = nearest swing high trên cur_price
+
+    Fallback TP nếu không có swing: min/max của lookback bars.
+
+    Trả dict:
+      rr       : float
+      sl_price : float
+      tp_price : float
+      rr_ok    : bool  (rr >= min_rr)
+      sl_pct   : float
+      tp_pct   : float
+    """
+    empty = {"rr": 0.0, "sl_price": 0.0, "tp_price": 0.0,
+             "rr_ok": False, "sl_pct": 0.0, "tp_pct": 0.0}
+
+    if df is None or len(df) < swing_len * 2 + 3 or cur_price <= 0:
+        return empty
+
+    df_w   = df.tail(lookback)
+    highs  = df_w["high"].values
+    lows   = df_w["low"].values
+    n      = len(highs)
+
+    # Swing highs / lows
+    swing_highs, swing_lows = [], []
+    for i in range(swing_len, n - swing_len):
+        if highs[i] == highs[i - swing_len: i + swing_len + 1].max():
+            swing_highs.append(float(highs[i]))
+        if lows[i] == lows[i - swing_len: i + swing_len + 1].min():
+            swing_lows.append(float(lows[i]))
+
+    if direction == "sell":
+        sl_price = fvg_top * (1 + sl_buffer)
+        risk     = sl_price - cur_price
+        if risk <= 0:
+            return empty
+        above_tp = [v for v in swing_lows if v < cur_price]
+        tp_price = max(above_tp) if above_tp else float(lows.min())
+        reward   = cur_price - tp_price
+
+    else:  # buy
+        sl_price = fvg_bot * (1 - sl_buffer)
+        risk     = cur_price - sl_price
+        if risk <= 0:
+            return empty
+        above_tp = [v for v in swing_highs if v > cur_price]
+        tp_price = min(above_tp) if above_tp else float(highs.max())
+        reward   = tp_price - cur_price
+
+    if risk <= 0 or reward <= 0:
+        return empty
+
+    rr = reward / risk
+    return {
+        "rr":       round(rr, 2),
+        "sl_price": round(sl_price, 6),
+        "tp_price": round(tp_price, 6),
+        "rr_ok":    rr >= min_rr,
+        "sl_pct":   round(abs(sl_price - cur_price) / cur_price * 100, 2),
+        "tp_pct":   round(abs(tp_price - cur_price) / cur_price * 100, 2),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # FVG DETECTOR  (port từ Section T3 Pine Script — FVG + iFVG)
 # ══════════════════════════════════════════════════════════════════════════
 
