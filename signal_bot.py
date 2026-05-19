@@ -421,18 +421,29 @@ class TelegramBot:
         """
         Render và gửi kết quả FVG scan (dùng chung cho /ft* và /fb*).
         direction : "sell" → Bear FVG / "buy" → Bull FVG
+
+        Ưu tiên hiển thị: 🎯FRESH+CNF > 🆕FRESH > ✅CONFIRM > 📊ACTIVE
+        (hits đã được scanner sort theo STATUS_RANK trước khi truyền vào)
         """
-        is_sell  = (direction == "sell")
-        dir_em   = "🔴" if is_sell else "🟢"
-        fvg_lbl  = "Bear FVG" if is_sell else "Bull FVG"
-        setup    = "SHORT"     if is_sell else "LONG"
+        is_sell   = (direction == "sell")
+        dir_em    = "🔴" if is_sell else "🟢"
+        fvg_lbl   = "Bear FVG" if is_sell else "Bull FVG"
+        setup     = "SHORT"     if is_sell else "LONG"
         score_key = "sell_score" if is_sell else "buy_score"
         score_lbl = "SELL"       if is_sell else "BUY"
+        cnf_dir   = "nến bearish↓" if is_sell else "nến bullish↑"
+
+        # ── Đếm summary ─────────────────────────────────────────────────────
+        fresh_cnf = [h for h in hits if h.get("signal_status") == "🎯FRESH+CNF"]
+        fresh     = [h for h in hits if h.get("signal_status") == "🆕FRESH"]
+        confirm   = [h for h in hits if h.get("signal_status") == "✅CONFIRM"]
+        active    = [h for h in hits if h.get("signal_status") == "📊ACTIVE"]
 
         strong = [h for h in hits if h["tier"] == "🔥"]
         good   = [h for h in hits if h["tier"] == "⚡"]
         watch  = [h for h in hits if h["tier"] == "📌"]
 
+        # ── Row renderer ────────────────────────────────────────────────────
         def _row(h: dict) -> str:
             sym    = h["symbol"].replace("USDT", "")
             ftype  = h.get("fvg_type", direction)
@@ -443,38 +454,57 @@ class TelegramBot:
             pos    = "✅trong" if h.get("inside") else "🔔gần"
             ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
             sc     = h.get(score_key, 0)
+            prev   = h.get("prev_score", 0)
+            status = h.get("signal_status", "📊ACTIVE")
+
+            # Freshness detail: prev_score → cur_score
+            fresh_tag = ""
+            if h.get("signal_fresh"):
+                fresh_tag = f"  📈{prev}→{sc}"   # score vừa bật lên
+            # Confirmation detail
+            cnf_tag = f"  {cnf_dir}" if h.get("candle_confirms") else ""
+
             return (
-                f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`  {f_em}{f_lbl} {pos}\n"
-                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`  "
-                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  "
-                f"{score_lbl}:`{sc}/11`  _{h['age_bars']}nến_\n"
+                f"{h['tier']} *{sym}*  {status}  `{h['cur_price']:.4f}`\n"
+                f"  {f_em}{f_lbl} {pos}  {score_lbl}:`{sc}/11`{fresh_tag}{cnf_tag}\n"
+                f"  FVG:`{h['fvg_bot']:.4f}`–`{h['fvg_top']:.4f}`  "
+                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  _{h['age_bars']}nến_\n"
             )
 
-        thr_lbl = "sell≥9" if is_sell else "buy≥9"
+        # ── Header ──────────────────────────────────────────────────────────
         header = (
             f"{dir_em} *{fvg_lbl} {fvg_tf.upper()} + {score_tf} {score_lbl}*"
             f" — {len(hits)} token\n"
-            f"🔥 Strong:{len(strong)}  ⚡ Good:{len(good)}  📌 Watch:{len(watch)}\n"
-            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)  →  Setup {setup}_\n"
+            f"🎯 Fresh+Cnf:{len(fresh_cnf)}  🆕 Fresh:{len(fresh)}"
+            f"  ✅ Cnf:{len(confirm)}  📊 Active:{len(active)}\n"
+            f"🔥 {len(strong)}  ⚡ {len(good)}  📌 {len(watch)}"
+            f"  _(tier: score + vị trí FVG)_\n"
+            f"_📈prev→cur = score vừa bật  {cnf_dir} = xác nhận_\n"
             f"{'─'*30}\n"
         )
 
-        sections = []
-        if strong:
-            sections.append(f"🔥 *STRONG* — {thr_lbl} + trong FVG ({len(strong)})\n")
-            for h in strong:
-                sections.append(_row(h))
-        if good:
-            sc_thr = "sell≥8" if is_sell else "buy≥8"
-            sections.append(f"\n⚡ *GOOD* — {sc_thr} ({len(good)})\n")
-            for h in good:
-                sections.append(_row(h))
-        if watch:
-            sc_thr = "sell≥6" if is_sell else "buy≥6"
-            sections.append(f"\n📌 *WATCH* — {sc_thr} ({len(watch)})\n")
-            for h in watch:
-                sections.append(_row(h))
+        # ── Sections — group theo signal_status, trong mỗi nhóm giữ tier sort ──
+        STATUS_GROUPS = [
+            ("🎯FRESH+CNF", fresh_cnf,
+             "🎯 *FRESH + XÁC NHẬN* — entry tốt nhất"),
+            ("🆕FRESH",     fresh,
+             "🆕 *FRESH* — signal vừa xuất hiện"),
+            ("✅CONFIRM",   confirm,
+             "✅ *CONFIRM* — nến xác nhận, signal không mới"),
+            ("📊ACTIVE",    active,
+             "📊 *ACTIVE* — signal cũ, chưa xác nhận"),
+        ]
 
+        sections = []
+        for _key, group, label in STATUS_GROUPS:
+            if not group:
+                continue
+            sections.append(f"{label} ({len(group)})\n")
+            for h in group:
+                sections.append(_row(h))
+            sections.append("\n")
+
+        # ── Gửi ─────────────────────────────────────────────────────────────
         chunk = header
         for line in sections:
             if len(chunk) + len(line) > 3900:
