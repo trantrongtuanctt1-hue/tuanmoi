@@ -422,7 +422,7 @@ class TelegramBot:
         Render và gửi kết quả FVG scan (dùng chung cho /ft* và /fb*).
         direction : "sell" → Bear FVG / "buy" → Bull FVG
 
-        Ưu tiên hiển thị: 🎯FRESH+CNF > 🆕FRESH > ✅CONFIRM > 📊ACTIVE
+        Ưu tiên hiển thị: 🎰SNIPER > 🎯FRESH+CNF > 🆕FRESH > ✅CONFIRM > 📊ACTIVE
         (hits đã được scanner sort theo STATUS_RANK trước khi truyền vào)
         """
         is_sell   = (direction == "sell")
@@ -433,15 +433,17 @@ class TelegramBot:
         score_lbl = "SELL"       if is_sell else "BUY"
         cnf_dir   = "nến bearish↓" if is_sell else "nến bullish↑"
 
-        # ── Đếm summary ─────────────────────────────────────────────────────
+        # ── Đếm theo status ─────────────────────────────────────────────────
+        sniper    = [h for h in hits if h.get("signal_status") == "🎰SNIPER"]
         fresh_cnf = [h for h in hits if h.get("signal_status") == "🎯FRESH+CNF"]
         fresh     = [h for h in hits if h.get("signal_status") == "🆕FRESH"]
         confirm   = [h for h in hits if h.get("signal_status") == "✅CONFIRM"]
         active    = [h for h in hits if h.get("signal_status") == "📊ACTIVE"]
 
-        strong = [h for h in hits if h["tier"] == "🔥"]
-        good   = [h for h in hits if h["tier"] == "⚡"]
-        watch  = [h for h in hits if h["tier"] == "📌"]
+        rr_ok_cnt  = sum(1 for h in hits if h.get("rr_ok"))
+        sweep_cnt  = sum(1 for h in hits if h.get("liq_swept"))
+        choch_cnt  = sum(1 for h in hits if h.get("choch_ok"))
+        vol_cnt    = sum(1 for h in hits if h.get("vol_spike"))
 
         # ── Row renderer ────────────────────────────────────────────────────
         def _row(h: dict) -> str:
@@ -457,42 +459,80 @@ class TelegramBot:
             prev   = h.get("prev_score", 0)
             status = h.get("signal_status", "📊ACTIVE")
 
-            # Freshness detail: prev_score → cur_score
-            fresh_tag = ""
-            if h.get("signal_fresh"):
-                fresh_tag = f"  📈{prev}→{sc}"   # score vừa bật lên
-            # Confirmation detail
-            cnf_tag = f"  {cnf_dir}" if h.get("candle_confirms") else ""
+            # Dòng 1: symbol + status + giá
+            line1 = f"{h['tier']} *{sym}*  {status}  `{h['cur_price']:.4f}`\n"
 
-            return (
-                f"{h['tier']} *{sym}*  {status}  `{h['cur_price']:.4f}`\n"
-                f"  {f_em}{f_lbl} {pos}  {score_lbl}:`{sc}/11`{fresh_tag}{cnf_tag}\n"
-                f"  FVG:`{h['fvg_bot']:.4f}`–`{h['fvg_top']:.4f}`  "
-                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  _{h['age_bars']}nến_\n"
+            # Dòng 2: FVG + score + freshness + confirmation
+            fresh_tag = f"  📈{prev}→{sc}" if h.get("signal_fresh") else ""
+            cnf_tag   = f"  {cnf_dir}"     if h.get("candle_confirms") else ""
+            line2 = (
+                f"  {f_em}{f_lbl} {pos}  {score_lbl}:`{sc}/11`"
+                f"{fresh_tag}{cnf_tag}\n"
             )
+
+            # Dòng 3: FVG levels + khoảng cách
+            line3 = (
+                f"  FVG:`{h['fvg_bot']:.4f}`–`{h['fvg_top']:.4f}`"
+                f"  Mid{ab_mid}:`{h['dist_pct']:.2f}%`  _{h['age_bars']}nến_\n"
+            )
+
+            # Dòng 4: Sweep + CHoCH (nếu có)
+            extras = []
+            if h.get("liq_swept"):
+                extras.append(
+                    f"💧Sweep {h.get('liq_eq_type','')} "
+                    f"`{h.get('liq_level',0):.4f}` "
+                    f"({h.get('liq_bars_ago',0)}n trước)"
+                )
+            if h.get("choch_ok"):
+                extras.append(
+                    f"🔄CHoCH `{h.get('choch_level',0):.4f}` "
+                    f"({h.get('choch_bars_ago',0)}n trước)"
+                )
+            line4 = ("  " + "  ".join(extras) + "\n") if extras else ""
+
+            # Dòng 5: Volume + RR
+            vol_r   = h.get("vol_ratio", 1.0)
+            vol_tag = f"⚡Vol×{vol_r:.1f}" if h.get("vol_spike") else f"Vol×{vol_r:.1f}"
+            rr      = h.get("rr", 0.0)
+            rr_em   = "🟢" if h.get("rr_ok") else "🟡"
+            rr_tag  = f"{rr_em}RR:{rr:.1f}"
+            sl_p    = h.get("sl_price", 0.0)
+            tp_p    = h.get("tp_price", 0.0)
+            sl_pct  = h.get("sl_pct", 0.0)
+            tp_pct  = h.get("tp_pct", 0.0)
+            line5 = (
+                f"  {vol_tag}  {rr_tag}"
+                f"  🛑`{sl_p:.4f}`(-{sl_pct:.2f}%)"
+                f"  🎯`{tp_p:.4f}`(+{tp_pct:.2f}%)\n"
+            )
+
+            return line1 + line2 + line3 + line4 + line5
 
         # ── Header ──────────────────────────────────────────────────────────
         header = (
             f"{dir_em} *{fvg_lbl} {fvg_tf.upper()} + {score_tf} {score_lbl}*"
             f" — {len(hits)} token\n"
-            f"🎯 Fresh+Cnf:{len(fresh_cnf)}  🆕 Fresh:{len(fresh)}"
-            f"  ✅ Cnf:{len(confirm)}  📊 Active:{len(active)}\n"
-            f"🔥 {len(strong)}  ⚡ {len(good)}  📌 {len(watch)}"
-            f"  _(tier: score + vị trí FVG)_\n"
-            f"_📈prev→cur = score vừa bật  {cnf_dir} = xác nhận_\n"
+            f"🎰 Sniper:{len(sniper)}  🎯 Fresh+Cnf:{len(fresh_cnf)}"
+            f"  🆕 Fresh:{len(fresh)}  ✅ Cnf:{len(confirm)}  📊 Active:{len(active)}\n"
+            f"💧 Sweep:{sweep_cnt}  🔄 CHoCH:{choch_cnt}"
+            f"  ⚡ VolSpike:{vol_cnt}  🟢 RR≥1.5:{rr_ok_cnt}\n"
+            f"_SL=ngoài FVG+0.2%  TP=swing liq gần nhất_\n"
             f"{'─'*30}\n"
         )
 
-        # ── Sections — group theo signal_status, trong mỗi nhóm giữ tier sort ──
+        # ── Sections — theo status priority ──────────────────────────────────
         STATUS_GROUPS = [
+            ("🎰SNIPER",    sniper,
+             "🎰 *SNIPER* — Sweep + CHoCH + Fresh + Confirm  ← VÀO LỆNH"),
             ("🎯FRESH+CNF", fresh_cnf,
-             "🎯 *FRESH + XÁC NHẬN* — entry tốt nhất"),
+             "🎯 *FRESH + XÁC NHẬN* — entry tốt"),
             ("🆕FRESH",     fresh,
-             "🆕 *FRESH* — signal vừa xuất hiện"),
+             "🆕 *FRESH* — chờ nến xác nhận đóng cửa"),
             ("✅CONFIRM",   confirm,
-             "✅ *CONFIRM* — nến xác nhận, signal không mới"),
+             "✅ *CONFIRM* — nến ok, signal không mới"),
             ("📊ACTIVE",    active,
-             "📊 *ACTIVE* — signal cũ, chưa xác nhận"),
+             "📊 *ACTIVE* — signal cũ, theo dõi"),
         ]
 
         sections = []
