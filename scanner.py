@@ -213,50 +213,49 @@ class Scanner:
         logger.info(f"FVG scan done: {len(hits)} tokens in FVG ({tf})")
         return hits
 
-    async def scan_ft(self) -> list[dict]:
-        """
-        /ft — Quét toàn market, tìm token thỏa:
-          1. Giá đang TRONG hoặc GẦN vùng BEAR FVG 4h (buffer ±0.5%)
-             → chỉ Bear FVG + iFVG bear (vùng kháng cự, setup SHORT)
-          2. 15m ULTRA SELL score >= 6
+    # ──────────────────────────────────────────────────────────────────────
+    # CORE ENGINE — Bear/Bull FVG scan với bất kỳ TF nào
+    # ──────────────────────────────────────────────────────────────────────
 
-        Kết quả chia 3 tier:
-          🔥 STRONG : sell >= 9  +  trong FVG (dist=0)
-          ⚡ GOOD   : sell >= 8  +  trong hoặc gần FVG
-          📌 WATCH  : sell >= 6  +  trong hoặc gần FVG
-        Sort: sell_score cao → dist_pct gần nhất.
+    async def _scan_bear_fvg(self, fvg_tf: str, score_tf: str) -> list[dict]:
+        """
+        Core engine cho /ft, /ft1h, /ft1d.
+        fvg_tf  : TF để detect FVG (ví dụ "4h", "1h", "1d")
+        score_tf: TF để tính ULTRA SELL score (ví dụ "15m", "1h")
+        Chỉ lấy Bear FVG + iFVG bear → setup SHORT.
         """
         symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
-        logger.info(f"FT scan: {len(symbols)} symbols (Bear FVG-4h + 15m SELL≥6)")
-
+        logger.info(
+            f"FT scan: {len(symbols)} symbols "
+            f"(Bear FVG-{fvg_tf} + {score_tf} SELL≥6)"
+        )
         sem = asyncio.Semaphore(CONCURRENCY)
 
         async def _check_one(sym: str) -> list[dict]:
             async with sem:
                 try:
-                    df4h, df15 = await asyncio.gather(
-                        self.fetcher.fetch_ohlcv(sym, "4h",  100),
-                        self.fetcher.fetch_ohlcv(sym, "15m", 100),
+                    df_fvg, df_score = await asyncio.gather(
+                        self.fetcher.fetch_ohlcv(sym, fvg_tf,   100),
+                        self.fetcher.fetch_ohlcv(sym, score_tf, 100),
                     )
-                    if df4h is None or len(df4h) < 3:
+                    if df_fvg is None or len(df_fvg) < 3:
                         return []
-                    if df15 is None or len(df15) < 50:
+                    if df_score is None or len(df_score) < 50:
                         return []
 
-                    # ── Bước 1: Bear FVG 4h — dùng buffer ±0.5% ──────────
-                    fvg_res = detect_fvg(df4h, min_gap_pct=0.0, max_keep=15)
+                    # ── Bước 1: Bear FVG — buffer ±0.5% ──────────────────
+                    fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
                     cur     = fvg_res["cur_price"]
                     if cur <= 0:
                         return []
 
-                    # Chỉ lấy Bear FVG + iFVG bear (kháng cự, setup SHORT)
                     bear_fvgs = fvg_res["bear_fvgs"]
                     ifvg_bear = [f for f in fvg_res["ifvgs"]
                                  if f.get("status", "") == "ifvg_bear"]
-                    candidates = [(f, "bear") for f in bear_fvgs] + \
+                    candidates = [(f, "bear")      for f in bear_fvgs] + \
                                  [(f, "ifvg_bear") for f in ifvg_bear]
 
-                    BUFFER = 0.005  # 0.5% quanh vùng FVG
+                    BUFFER   = 0.005
                     fvg_hits = []
                     for fvg, ftype in candidates:
                         top_buf = fvg["top"]    * (1 + BUFFER)
@@ -267,30 +266,27 @@ class Scanner:
                             inside   = fvg["bottom"] <= cur <= fvg["top"]
                             fvg_hits.append({**fvg, "dist_pct": round(dist_pct, 2),
                                              "inside": inside, "fvg_type": ftype})
-
                     if not fvg_hits:
                         return []
 
-                    # ── Bước 2: 15m ULTRA SELL score ──────────────────────
+                    # ── Bước 2: ULTRA SELL score trên score_tf ────────────
                     result = score_symbol(
                         sym,
-                        df_5m  = df15,
-                        df_15m = df15,
+                        df_5m  = df_score,
+                        df_15m = df_score,
                         df_1h  = None,
                         df_30m = None,
-                        df_4h  = df4h,
+                        df_4h  = df_fvg,
                         df_1d  = None,
                     )
-
                     sell_score = result.ultra_sell_score
                     if sell_score < 6:
                         return []
 
-                    # ── Bước 3: Build hit — lấy Bear FVG gần nhất ────────
+                    # ── Bước 3: Bear FVG gần giá nhất ────────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
-
                     tier = "🔥" if sell_score >= 9 and best["inside"] else (
                            "⚡" if sell_score >= 8 else "📌")
 
@@ -308,61 +304,58 @@ class Scanner:
                         "sell_score": sell_score,
                         "tier":       tier,
                     }]
-
                 except Exception as e:
-                    logger.debug(f"scan_ft {sym}: {e}")
+                    logger.debug(f"scan_bear_fvg {sym}: {e}")
                     return []
 
         all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
         hits = [item for sublist in all_lists for item in sublist]
         hits.sort(key=lambda x: (-x["sell_score"], x["dist_pct"]))
-        logger.info(f"FT scan done: {len(hits)} tokens (Bear FVG-4h + SELL≥6)")
+        logger.info(
+            f"FT ({fvg_tf}) done: {len(hits)} tokens "
+            f"(Bear FVG + {score_tf} SELL≥6)"
+        )
         return hits
 
-    async def scan_fb(self) -> list[dict]:
+    async def _scan_bull_fvg(self, fvg_tf: str, score_tf: str) -> list[dict]:
         """
-        /fb — Quét toàn market, tìm token thỏa:
-          1. Giá đang TRONG hoặc GẦN vùng BULL FVG 4h (buffer ±0.5%)
-             → chỉ Bull FVG + iFVG bull (vùng hỗ trợ, setup LONG)
-          2. 15m ULTRA BUY score >= 6
-
-        Kết quả chia 3 tier:
-          🔥 STRONG : buy >= 9  +  trong FVG (dist=0)
-          ⚡ GOOD   : buy >= 8  +  trong hoặc gần FVG
-          📌 WATCH  : buy >= 6  +  trong hoặc gần FVG
-        Sort: buy_score cao → dist_pct gần nhất.
+        Core engine cho /fb, /fb1h, /fb1d.
+        fvg_tf  : TF để detect FVG (ví dụ "4h", "1h", "1d")
+        score_tf: TF để tính ULTRA BUY score (ví dụ "15m", "1h")
+        Chỉ lấy Bull FVG + iFVG bull → setup LONG.
         """
         symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
-        logger.info(f"FB scan: {len(symbols)} symbols (Bull FVG-4h + 15m BUY≥6)")
-
+        logger.info(
+            f"FB scan: {len(symbols)} symbols "
+            f"(Bull FVG-{fvg_tf} + {score_tf} BUY≥6)"
+        )
         sem = asyncio.Semaphore(CONCURRENCY)
 
         async def _check_one(sym: str) -> list[dict]:
             async with sem:
                 try:
-                    df4h, df15 = await asyncio.gather(
-                        self.fetcher.fetch_ohlcv(sym, "4h",  100),
-                        self.fetcher.fetch_ohlcv(sym, "15m", 100),
+                    df_fvg, df_score = await asyncio.gather(
+                        self.fetcher.fetch_ohlcv(sym, fvg_tf,   100),
+                        self.fetcher.fetch_ohlcv(sym, score_tf, 100),
                     )
-                    if df4h is None or len(df4h) < 3:
+                    if df_fvg is None or len(df_fvg) < 3:
                         return []
-                    if df15 is None or len(df15) < 50:
+                    if df_score is None or len(df_score) < 50:
                         return []
 
-                    # ── Bước 1: Bull FVG 4h — dùng buffer ±0.5% ──────────
-                    fvg_res = detect_fvg(df4h, min_gap_pct=0.0, max_keep=15)
+                    # ── Bước 1: Bull FVG — buffer ±0.5% ──────────────────
+                    fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
                     cur     = fvg_res["cur_price"]
                     if cur <= 0:
                         return []
 
-                    # Chỉ lấy Bull FVG + iFVG bull (hỗ trợ, setup LONG)
                     bull_fvgs = fvg_res["bull_fvgs"]
                     ifvg_bull = [f for f in fvg_res["ifvgs"]
                                  if f.get("status", "") == "ifvg_bull"]
-                    candidates = [(f, "bull") for f in bull_fvgs] + \
+                    candidates = [(f, "bull")      for f in bull_fvgs] + \
                                  [(f, "ifvg_bull") for f in ifvg_bull]
 
-                    BUFFER = 0.005  # 0.5% quanh vùng FVG
+                    BUFFER   = 0.005
                     fvg_hits = []
                     for fvg, ftype in candidates:
                         top_buf = fvg["top"]    * (1 + BUFFER)
@@ -373,30 +366,27 @@ class Scanner:
                             inside   = fvg["bottom"] <= cur <= fvg["top"]
                             fvg_hits.append({**fvg, "dist_pct": round(dist_pct, 2),
                                              "inside": inside, "fvg_type": ftype})
-
                     if not fvg_hits:
                         return []
 
-                    # ── Bước 2: 15m ULTRA BUY score ───────────────────────
+                    # ── Bước 2: ULTRA BUY score trên score_tf ─────────────
                     result = score_symbol(
                         sym,
-                        df_5m  = df15,
-                        df_15m = df15,
+                        df_5m  = df_score,
+                        df_15m = df_score,
                         df_1h  = None,
                         df_30m = None,
-                        df_4h  = df4h,
+                        df_4h  = df_fvg,
                         df_1d  = None,
                     )
-
                     buy_score = result.ultra_buy_score
                     if buy_score < 6:
                         return []
 
-                    # ── Bước 3: Build hit — lấy Bull FVG gần nhất ────────
+                    # ── Bước 3: Bull FVG gần giá nhất ────────────────────
                     fvg_hits.sort(key=lambda x: x["dist_pct"])
                     best = fvg_hits[0]
                     mid  = (best["top"] + best["bottom"]) / 2
-
                     tier = "🔥" if buy_score >= 9 and best["inside"] else (
                            "⚡" if buy_score >= 8 else "📌")
 
@@ -414,13 +404,43 @@ class Scanner:
                         "buy_score": buy_score,
                         "tier":      tier,
                     }]
-
                 except Exception as e:
-                    logger.debug(f"scan_fb {sym}: {e}")
+                    logger.debug(f"scan_bull_fvg {sym}: {e}")
                     return []
 
         all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
         hits = [item for sublist in all_lists for item in sublist]
         hits.sort(key=lambda x: (-x["buy_score"], x["dist_pct"]))
-        logger.info(f"FB scan done: {len(hits)} tokens (Bull FVG-4h + BUY≥6)")
+        logger.info(
+            f"FB ({fvg_tf}) done: {len(hits)} tokens "
+            f"(Bull FVG + {score_tf} BUY≥6)"
+        )
         return hits
+
+    # ──────────────────────────────────────────────────────────────────────
+    # PUBLIC WRAPPERS — mỗi lệnh bot gọi 1 trong các hàm này
+    # ──────────────────────────────────────────────────────────────────────
+
+    # /ft  — Bear FVG 4h  + 15m SELL
+    async def scan_ft(self)   -> list[dict]:
+        return await self._scan_bear_fvg("4h",  "15m")
+
+    # /ft1h — Bear FVG 1h  + 15m SELL
+    async def scan_ft1h(self) -> list[dict]:
+        return await self._scan_bear_fvg("1h",  "15m")
+
+    # /ft1d — Bear FVG 1d  + 1h  SELL  (khung daily → dùng 1h score)
+    async def scan_ft1d(self) -> list[dict]:
+        return await self._scan_bear_fvg("1d",  "1h")
+
+    # /fb   — Bull FVG 4h  + 15m BUY
+    async def scan_fb(self)   -> list[dict]:
+        return await self._scan_bull_fvg("4h",  "15m")
+
+    # /fb1h — Bull FVG 1h  + 15m BUY
+    async def scan_fb1h(self) -> list[dict]:
+        return await self._scan_bull_fvg("1h",  "15m")
+
+    # /fb1d — Bull FVG 1d  + 1h  BUY   (khung daily → dùng 1h score)
+    async def scan_fb1d(self) -> list[dict]:
+        return await self._scan_bull_fvg("1d",  "1h")
