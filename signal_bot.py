@@ -224,7 +224,11 @@ class TelegramBot:
             ("fvg",      self._fvg),
             ("fvgscan",  self._fvgscan),
             ("ft",       self._ft),
+            ("ft1h",     self._ft1h),
+            ("ft1d",     self._ft1d),
             ("fb",       self._fb),
+            ("fb1h",     self._fb1h),
+            ("fb1d",     self._fb1d),
             ("check",    self._check),
             ("status",   self._status),
             ("debug",    self._debug),
@@ -245,8 +249,12 @@ class TelegramBot:
             "/scan     — Quét tất cả token, signal đủ điều kiện\n"
             "/top      — Top 5 tín hiệu mạnh nhất\n"
             "/strong   — 1D STRONG BUY/SELL (ultra_1d ≥ 9)\n"
-            "/ft       — 🔴 Bear FVG 4h + 15m SELL ≥ 6 (setup SHORT)\n"
-            "/fb       — 🟢 Bull FVG 4h + 15m BUY ≥ 6 (setup LONG)\n"
+            "/ft       — 🔴 Bear FVG 4h  + 15m SELL ≥ 6 (setup SHORT)\n"
+            "/ft1h     — 🔴 Bear FVG 1h  + 15m SELL ≥ 6 (setup SHORT)\n"
+            "/ft1d     — 🔴 Bear FVG 1d  + 1h  SELL ≥ 6 (setup SHORT)\n"
+            "/fb       — 🟢 Bull FVG 4h  + 15m BUY  ≥ 6 (setup LONG)\n"
+            "/fb1h     — 🟢 Bull FVG 1h  + 15m BUY  ≥ 6 (setup LONG)\n"
+            "/fb1d     — 🟢 Bull FVG 1d  + 1h  BUY  ≥ 6 (setup LONG)\n"
             "/fvgscan [tf] — Toàn market đang trong FVG (mặc định 4h)\n"
             "/fvg BTC [tf] — FVG của 1 token (tf: 5m 15m 1h 4h 1d)\n"
             "/check BTC — Phân tích chi tiết 1 token\n"
@@ -395,141 +403,170 @@ class TelegramBot:
             parse_mode="Markdown"
         )
 
+    # ── Shared display helper ─────────────────────────────────────────────
+
+    async def _send_fvg_hits(
+        self,
+        u: Update,
+        hits: list[dict],
+        direction: str,   # "sell" hoặc "buy"
+        fvg_tf: str,
+        score_tf: str,
+    ):
+        """
+        Render và gửi kết quả FVG scan (dùng chung cho /ft* và /fb*).
+        direction : "sell" → Bear FVG / "buy" → Bull FVG
+        """
+        is_sell  = (direction == "sell")
+        dir_em   = "🔴" if is_sell else "🟢"
+        fvg_lbl  = "Bear FVG" if is_sell else "Bull FVG"
+        setup    = "SHORT"     if is_sell else "LONG"
+        score_key = "sell_score" if is_sell else "buy_score"
+        score_lbl = "SELL"       if is_sell else "BUY"
+
+        strong = [h for h in hits if h["tier"] == "🔥"]
+        good   = [h for h in hits if h["tier"] == "⚡"]
+        watch  = [h for h in hits if h["tier"] == "📌"]
+
+        def _row(h: dict) -> str:
+            sym    = h["symbol"].replace("USDT", "")
+            ftype  = h.get("fvg_type", direction)
+            f_em   = "🔵" if "ifvg" in ftype else dir_em
+            f_lbl  = (f"iFVG-{'Bear' if is_sell else 'Bull'}"
+                      if "ifvg" in ftype
+                      else f"{'Bear' if is_sell else 'Bull'}FVG")
+            pos    = "✅trong" if h.get("inside") else "🔔gần"
+            ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
+            sc     = h.get(score_key, 0)
+            return (
+                f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`  {f_em}{f_lbl} {pos}\n"
+                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`  "
+                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  "
+                f"{score_lbl}:`{sc}/11`  _{h['age_bars']}nến_\n"
+            )
+
+        thr_lbl = "sell≥9" if is_sell else "buy≥9"
+        header = (
+            f"{dir_em} *{fvg_lbl} {fvg_tf.upper()} + {score_tf} {score_lbl}*"
+            f" — {len(hits)} token\n"
+            f"🔥 Strong:{len(strong)}  ⚡ Good:{len(good)}  📌 Watch:{len(watch)}\n"
+            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)  →  Setup {setup}_\n"
+            f"{'─'*30}\n"
+        )
+
+        sections = []
+        if strong:
+            sections.append(f"🔥 *STRONG* — {thr_lbl} + trong FVG ({len(strong)})\n")
+            for h in strong:
+                sections.append(_row(h))
+        if good:
+            sc_thr = "sell≥8" if is_sell else "buy≥8"
+            sections.append(f"\n⚡ *GOOD* — {sc_thr} ({len(good)})\n")
+            for h in good:
+                sections.append(_row(h))
+        if watch:
+            sc_thr = "sell≥6" if is_sell else "buy≥6"
+            sections.append(f"\n📌 *WATCH* — {sc_thr} ({len(watch)})\n")
+            for h in watch:
+                sections.append(_row(h))
+
+        chunk = header
+        for line in sections:
+            if len(chunk) + len(line) > 3900:
+                await u.message.reply_text(chunk, parse_mode="Markdown")
+                chunk = line
+            else:
+                chunk += line
+        if chunk:
+            await u.message.reply_text(chunk, parse_mode="Markdown")
+
+    # ── /ft family (Bear FVG + SELL) ─────────────────────────────────────
+
     async def _ft(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /ft — Bear FVG 4h (buffer ±0.5%) + 15m SELL ≥ 6  →  setup SHORT
-        Tier: 🔥 STRONG (sell≥9 + trong FVG) | ⚡ GOOD (sell≥8) | 📌 WATCH (sell≥6)
-        """
+        """/ft — Bear FVG 4h + 15m SELL ≥ 6  →  setup SHORT"""
         await u.message.reply_text(
             "🔴 Đang quét *Bear FVG 4h + 15m SELL* toàn market (~60–90s)...",
             parse_mode="Markdown"
         )
-
         hits = await self.scanner.scan_ft()
-
         if not hits:
             await u.message.reply_text(
-                "❌ Không tìm được token nào.\n"
-                "Thị trường chưa có setup Bear FVG 4h + SELL 15m lúc này."
+                "❌ Không có setup Bear FVG 4h + SELL 15m lúc này."
             )
             return
+        await self._send_fvg_hits(u, hits, "sell", "4h", "15m")
 
-        strong = [h for h in hits if h["tier"] == "🔥"]
-        good   = [h for h in hits if h["tier"] == "⚡"]
-        watch  = [h for h in hits if h["tier"] == "📌"]
-
-        def _row(h: dict) -> str:
-            sym    = h["symbol"].replace("USDT", "")
-            ftype  = h.get("fvg_type", "bear")
-            f_em   = "🔵" if "ifvg" in ftype else "🔴"
-            f_lbl  = "iFVG-Bear" if "ifvg" in ftype else "BearFVG"
-            pos    = "✅trong" if h.get("inside") else "🔔gần"
-            ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
-            return (
-                f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`  {f_em}{f_lbl} {pos}\n"
-                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`  "
-                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  "
-                f"SELL:`{h['sell_score']}/11`  _{h['age_bars']}nến_\n"
-            )
-
-        header = (
-            f"🔴 *Bear FVG 4h + 15m SELL* — {len(hits)} token\n"
-            f"🔥 Strong:{len(strong)}  ⚡ Good:{len(good)}  📌 Watch:{len(watch)}\n"
-            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)  →  Setup SHORT_\n"
-            f"{'─'*30}\n"
+    async def _ft1h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """/ft1h — Bear FVG 1h + 15m SELL ≥ 6  →  setup SHORT"""
+        await u.message.reply_text(
+            "🔴 Đang quét *Bear FVG 1h + 15m SELL* toàn market (~60–90s)...",
+            parse_mode="Markdown"
         )
+        hits = await self.scanner.scan_ft1h()
+        if not hits:
+            await u.message.reply_text(
+                "❌ Không có setup Bear FVG 1h + SELL 15m lúc này."
+            )
+            return
+        await self._send_fvg_hits(u, hits, "sell", "1h", "15m")
 
-        sections = []
-        if strong:
-            sections.append(f"🔥 *STRONG* — sell≥9 + trong FVG ({len(strong)})\n")
-            for h in strong:
-                sections.append(_row(h))
-        if good:
-            sections.append(f"\n⚡ *GOOD* — sell≥8 ({len(good)})\n")
-            for h in good:
-                sections.append(_row(h))
-        if watch:
-            sections.append(f"\n📌 *WATCH* — sell≥6 ({len(watch)})\n")
-            for h in watch:
-                sections.append(_row(h))
+    async def _ft1d(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """/ft1d — Bear FVG 1d + 1h SELL ≥ 6  →  setup SHORT"""
+        await u.message.reply_text(
+            "🔴 Đang quét *Bear FVG 1D + 1h SELL* toàn market (~60–90s)...",
+            parse_mode="Markdown"
+        )
+        hits = await self.scanner.scan_ft1d()
+        if not hits:
+            await u.message.reply_text(
+                "❌ Không có setup Bear FVG 1D + SELL 1h lúc này."
+            )
+            return
+        await self._send_fvg_hits(u, hits, "sell", "1d", "1h")
 
-        chunk = header
-        for line in sections:
-            if len(chunk) + len(line) > 3900:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = line
-            else:
-                chunk += line
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
+    # ── /fb family (Bull FVG + BUY) ──────────────────────────────────────
 
     async def _fb(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /fb — Bull FVG 4h (buffer ±0.5%) + 15m BUY ≥ 6  →  setup LONG
-        Tier: 🔥 STRONG (buy≥9 + trong FVG) | ⚡ GOOD (buy≥8) | 📌 WATCH (buy≥6)
-        """
+        """/fb — Bull FVG 4h + 15m BUY ≥ 6  →  setup LONG"""
         await u.message.reply_text(
             "🟢 Đang quét *Bull FVG 4h + 15m BUY* toàn market (~60–90s)...",
             parse_mode="Markdown"
         )
-
         hits = await self.scanner.scan_fb()
-
         if not hits:
             await u.message.reply_text(
-                "❌ Không tìm được token nào.\n"
-                "Thị trường chưa có setup Bull FVG 4h + BUY 15m lúc này."
+                "❌ Không có setup Bull FVG 4h + BUY 15m lúc này."
             )
             return
+        await self._send_fvg_hits(u, hits, "buy", "4h", "15m")
 
-        strong = [h for h in hits if h["tier"] == "🔥"]
-        good   = [h for h in hits if h["tier"] == "⚡"]
-        watch  = [h for h in hits if h["tier"] == "📌"]
-
-        def _row(h: dict) -> str:
-            sym    = h["symbol"].replace("USDT", "")
-            ftype  = h.get("fvg_type", "bull")
-            f_em   = "🔵" if "ifvg" in ftype else "🟢"
-            f_lbl  = "iFVG-Bull" if "ifvg" in ftype else "BullFVG"
-            pos    = "✅trong" if h.get("inside") else "🔔gần"
-            ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
-            return (
-                f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`  {f_em}{f_lbl} {pos}\n"
-                f"  FVG: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`  "
-                f"Cách mid:`{h['dist_pct']:.2f}%`{ab_mid}  "
-                f"BUY:`{h['buy_score']}/11`  _{h['age_bars']}nến_\n"
-            )
-
-        header = (
-            f"🟢 *Bull FVG 4h + 15m BUY* — {len(hits)} token\n"
-            f"🔥 Strong:{len(strong)}  ⚡ Good:{len(good)}  📌 Watch:{len(watch)}\n"
-            f"_✅=giá trong FVG  🔔=gần FVG (±0.5%)  →  Setup LONG_\n"
-            f"{'─'*30}\n"
+    async def _fb1h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """/fb1h — Bull FVG 1h + 15m BUY ≥ 6  →  setup LONG"""
+        await u.message.reply_text(
+            "🟢 Đang quét *Bull FVG 1h + 15m BUY* toàn market (~60–90s)...",
+            parse_mode="Markdown"
         )
+        hits = await self.scanner.scan_fb1h()
+        if not hits:
+            await u.message.reply_text(
+                "❌ Không có setup Bull FVG 1h + BUY 15m lúc này."
+            )
+            return
+        await self._send_fvg_hits(u, hits, "buy", "1h", "15m")
 
-        sections = []
-        if strong:
-            sections.append(f"🔥 *STRONG* — buy≥9 + trong FVG ({len(strong)})\n")
-            for h in strong:
-                sections.append(_row(h))
-        if good:
-            sections.append(f"\n⚡ *GOOD* — buy≥8 ({len(good)})\n")
-            for h in good:
-                sections.append(_row(h))
-        if watch:
-            sections.append(f"\n📌 *WATCH* — buy≥6 ({len(watch)})\n")
-            for h in watch:
-                sections.append(_row(h))
-
-        chunk = header
-        for line in sections:
-            if len(chunk) + len(line) > 3900:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = line
-            else:
-                chunk += line
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
+    async def _fb1d(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """/fb1d — Bull FVG 1d + 1h BUY ≥ 6  →  setup LONG"""
+        await u.message.reply_text(
+            "🟢 Đang quét *Bull FVG 1D + 1h BUY* toàn market (~60–90s)...",
+            parse_mode="Markdown"
+        )
+        hits = await self.scanner.scan_fb1d()
+        if not hits:
+            await u.message.reply_text(
+                "❌ Không có setup Bull FVG 1D + BUY 1h lúc này."
+            )
+            return
+        await self._send_fvg_hits(u, hits, "buy", "1d", "1h")
 
     async def _fvgscan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         """
