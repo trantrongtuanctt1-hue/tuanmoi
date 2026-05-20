@@ -1083,6 +1083,216 @@ def score_symbol(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# INDICATOR 1 — EMA CROSSOVER SIGNAL
+# Port từ Pine Script "Buy Sell Signal":
+#   bullTrend = emaFast > emaSlow
+#   trendChange = bullTrend != bullTrend[1]   (EMA vừa cross)
+#   buySignal   = bullTrend AND trendChange AND (confirmCandle → close > open)
+#
+# Trả dict:
+#   buy_signal   : bool  — EMA vừa cross lên + nến xác nhận bullish
+#   sell_signal  : bool  — EMA vừa cross xuống + nến xác nhận bearish
+#   bull_trend   : bool  — fast > slow (xu hướng hiện tại)
+#   entry_price  : float
+#   stop_loss    : float — low - ATR * atrMultSL
+#   take_profit  : float — entry + risk * riskReward
+#   risk         : float
+#   ema_fast     : float
+#   ema_slow     : float
+# ══════════════════════════════════════════════════════════════════════════
+
+def ema_crossover_signal(
+    df:              pd.DataFrame,
+    ema_fast_len:    int   = 5,
+    ema_slow_len:    int   = 13,
+    atr_len:         int   = 14,
+    atr_mult_sl:     float = 0.5,
+    risk_reward:     float = 3.0,
+    confirm_candle:  bool  = True,
+) -> dict:
+    """
+    Detect EMA 5/13 crossover BUY/SELL signal (Indicator 1).
+    confirm_candle=True: yêu cầu nến close > open (bull) hoặc close < open (bear).
+
+    Lưu ý: tín hiệu được tính tại nến ĐÓNG (iloc[-1]).
+    Nếu muốn "cross vừa xảy ra ở nến trước" (không repainting) thì
+    dùng iloc[-2] cho trendChange check, nhưng ở đây port đúng Pine logic.
+    """
+    _empty = {
+        "buy_signal": False, "sell_signal": False,
+        "bull_trend": False,
+        "entry_price": 0.0, "stop_loss": 0.0, "take_profit": 0.0,
+        "risk": 0.0, "ema_fast": 0.0, "ema_slow": 0.0,
+        "fresh_cross": False,
+    }
+    min_len = max(ema_fast_len, ema_slow_len, atr_len) + 5
+    if df is None or len(df) < min_len:
+        return _empty
+
+    close  = df["close"]
+    opens  = df["open"]
+    lows   = df["low"]
+    highs  = df["high"]
+
+    fast_series = _ema(close, ema_fast_len)
+    slow_series = _ema(close, ema_slow_len)
+    atr_series  = _atr(df, atr_len)
+
+    # Hiện tại (nến cuối) và nến trước
+    fast_cur  = float(fast_series.iloc[-1])
+    fast_prev = float(fast_series.iloc[-2])
+    slow_cur  = float(slow_series.iloc[-1])
+    slow_prev = float(slow_series.iloc[-2])
+
+    bull_trend_cur  = fast_cur  > slow_cur
+    bull_trend_prev = fast_prev > slow_prev
+
+    # Trend change = cross xảy ra giữa nến trước và nến hiện tại
+    trend_change = bull_trend_cur != bull_trend_prev
+
+    cur_close = float(close.iloc[-1])
+    cur_open  = float(opens.iloc[-1])
+    cur_low   = float(lows.iloc[-1])
+    cur_high  = float(highs.iloc[-1])
+    atr_val   = float(atr_series.iloc[-1])
+
+    # Buy/Sell conditions (giống Pine)
+    if confirm_candle:
+        buy_signal  = bull_trend_cur  and trend_change and cur_close > cur_open
+        sell_signal = (not bull_trend_cur) and trend_change and cur_close < cur_open
+    else:
+        buy_signal  = bull_trend_cur  and trend_change
+        sell_signal = (not bull_trend_cur) and trend_change
+
+    # SL / TP
+    if buy_signal:
+        entry      = cur_close
+        stop_loss  = cur_low - atr_val * atr_mult_sl
+        risk       = entry - stop_loss
+        take_profit = entry + risk * risk_reward if risk > 0 else 0.0
+    elif sell_signal:
+        entry      = cur_close
+        stop_loss  = cur_high + atr_val * atr_mult_sl
+        risk       = stop_loss - entry
+        take_profit = entry - risk * risk_reward if risk > 0 else 0.0
+    else:
+        entry      = cur_close
+        stop_loss  = cur_low - atr_val * atr_mult_sl
+        risk       = entry - stop_loss
+        take_profit = entry + risk * risk_reward if risk > 0 else 0.0
+
+    return {
+        "buy_signal":   buy_signal,
+        "sell_signal":  sell_signal,
+        "bull_trend":   bull_trend_cur,
+        "fresh_cross":  trend_change,
+        "entry_price":  round(entry, 6),
+        "stop_loss":    round(stop_loss, 6),
+        "take_profit":  round(take_profit, 6),
+        "risk":         round(risk, 6),
+        "ema_fast":     round(fast_cur, 6),
+        "ema_slow":     round(slow_cur, 6),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# INDICATOR 2 — LINEAR REGRESSION CHANNEL (slope-based bull/bear)
+# Port từ Ceez Prime: LinReg channel với slope-based coloring
+#   - Tính Linear Regression trên close (linreg_len nến)
+#   - slope > 0  → channel xanh (bullish)
+#   - slope < 0  → channel đỏ (bearish)
+#   - overextension: price > upper band hoặc < lower band
+#
+# Trả dict:
+#   linreg_bull   : bool  — slope > 0 (channel màu xanh)
+#   slope         : float — slope của đường hồi quy
+#   slope_pct     : float — slope tính theo % price
+#   linreg_val    : float — giá trị linreg cuối
+#   upper_band    : float — linreg + mult * stddev
+#   lower_band    : float — linreg - mult * stddev
+#   overextended_up   : bool — close > upper_band
+#   overextended_down : bool — close < lower_band
+#   price_vs_linreg   : float — % cách giá so với linreg (+ là trên, - là dưới)
+# ══════════════════════════════════════════════════════════════════════════
+
+def linreg_channel(
+    df:          pd.DataFrame,
+    length:      int   = 50,
+    mult:        float = 2.0,
+    slope_smooth: int  = 3,   # EMA smoothing cho slope để tránh nhiễu
+) -> dict:
+    """
+    Linear Regression Channel với slope-based coloring (Ceez Prime style).
+    bull  = slope của đường hồi quy > 0 (channel xanh trên chart).
+    """
+    _empty = {
+        "linreg_bull": False, "slope": 0.0, "slope_pct": 0.0,
+        "linreg_val": 0.0, "upper_band": 0.0, "lower_band": 0.0,
+        "overextended_up": False, "overextended_down": False,
+        "price_vs_linreg": 0.0,
+    }
+    if df is None or len(df) < length + slope_smooth + 2:
+        return _empty
+
+    close = df["close"].values.astype(float)
+    n     = len(close)
+
+    # Tính linear regression trên rolling window = length
+    # Dùng numpy polyfit cho window cuối
+    def _lr_val(arr: np.ndarray) -> tuple[float, float]:
+        """Trả (intercept_at_end, slope) cho arr."""
+        x = np.arange(len(arr), dtype=float)
+        if np.std(arr) == 0:
+            return float(arr[-1]), 0.0
+        coeffs = np.polyfit(x, arr, 1)   # coeffs[0]=slope, coeffs[1]=intercept
+        slope_  = float(coeffs[0])
+        lr_end  = float(np.polyval(coeffs, len(arr) - 1))
+        return lr_end, slope_
+
+    # Tính LR value tại mỗi bar để lấy residuals (cho stddev band)
+    # Tối ưu: chỉ tính trên window cuối
+    window = close[n - length: n]
+    lr_end, slope = _lr_val(window)
+
+    # Rebuild full LR line trong window để tính residuals
+    x = np.arange(length, dtype=float)
+    lr_line = np.polyval([slope, lr_end - slope * (length - 1)], x)
+    residuals = window - lr_line
+    stddev    = float(np.std(residuals, ddof=0))
+
+    upper_band = lr_end + mult * stddev
+    lower_band = lr_end - mult * stddev
+
+    cur_close = float(close[-1])
+    price_vs  = (cur_close - lr_end) / lr_end * 100.0 if lr_end != 0 else 0.0
+    slope_pct = slope / cur_close * 100.0 if cur_close != 0 else 0.0
+
+    # Smooth slope để tránh flip nhiễu 1 nến
+    if slope_smooth > 1 and n >= length + slope_smooth:
+        raw_slopes = []
+        for k in range(slope_smooth):
+            w = close[n - length - k: n - k]
+            if len(w) == length:
+                _, s = _lr_val(w)
+                raw_slopes.append(s)
+        if raw_slopes:
+            slope = float(np.mean(raw_slopes))
+            slope_pct = slope / cur_close * 100.0 if cur_close != 0 else 0.0
+
+    return {
+        "linreg_bull":        slope > 0,
+        "slope":              round(slope, 8),
+        "slope_pct":          round(slope_pct, 4),
+        "linreg_val":         round(lr_end, 6),
+        "upper_band":         round(upper_band, 6),
+        "lower_band":         round(lower_band, 6),
+        "overextended_up":    cur_close > upper_band,
+        "overextended_down":  cur_close < lower_band,
+        "price_vs_linreg":    round(price_vs, 2),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # NEW ① LIQUIDITY SWEEP DETECTOR
 # Phát hiện giá vừa quét equal highs/lows hoặc swing high/low trước khi
 # chạm FVG — điều kiện SMC entry chất lượng cao nhất
