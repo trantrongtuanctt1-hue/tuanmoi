@@ -16,6 +16,7 @@ from signals import (
     SignalResult, score_symbol, detect_fvg,
     detect_liquidity_sweep, detect_choch,
     detect_vol_spike_at_fvg, calc_fvg_rr,
+    ema_crossover_signal, linreg_channel,
 )
 
 logger = logging.getLogger(__name__)
@@ -630,364 +631,6 @@ class Scanner:
         return hits
 
     # ──────────────────────────────────────────────────────────────────────
-    # /top — COMPOSITE SCAN: gộp mọi điều kiện, sort theo lợi nhuận tiềm năng
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def scan_top_composite(self) -> list[dict]:
-        """
-        Quét TOÀN thị trường, gộp TẤT CẢ điều kiện từ mọi lệnh:
-          • ULTRA Score (15m / 1h / 4h / 1d)         — từ scan_all / /scan
-          • Bull FVG  (4h + 1h + 1d) × BUY  score    — từ /fb /fb1h /fb1d
-          • Bear FVG  (4h + 1h + 1d) × SELL score    — từ /ft /ft1h /ft1d
-          • Liquidity Sweep + CHoCH + Vol Spike + RR  — từ engine FVG
-          • SXL score / vol_confirm / is_premium       — từ SignalResult
-
-        Composite score (0–100) tính như sau:
-          [A] ULTRA_MAX   = max score bất kỳ TF         → 0–11  (×4 = 0–44)
-          [B] FVG tier    = SNIPER=5 FRESH+CNF=4 FRESH=3 CONFIRM=2 ACTIVE=1 NO=0  (×3 = 0–15)
-          [C] Confluence  = Sweep+CHoCH+VolSpike+RR_ok  → 0–4   (×3 = 0–12)
-          [D] SXL score   = 0–10                         → 0–10  (×1 = 0–10)
-          [E] Bonus       = is_premium+2 / vol_confirm+1 → 0–3   (×1 = 0–3)
-          [F] RR bonus    = min(rr*2, 8)                 → 0–8   (×1 = 0–8)
-
-        Tổng: 0–92 → chuẩn hóa × (100/92)
-
-        Kết quả trả về list[dict] sorted giảm dần composite_score.
-        """
-        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
-        logger.info(f"[/top] Composite scan: {len(symbols)} symbols (6TF + FVG 3TF)…")
-
-        BUFFER_MAP = {"1h": 0.003, "4h": 0.005, "1d": 0.010}
-        FRESH_LOOKBACK = 3
-        sem = asyncio.Semaphore(CONCURRENCY)
-
-        async def _analyse(sym: str) -> Optional[dict]:
-            async with sem:
-                try:
-                    # ── Fetch tất cả TF cần thiết ──────────────────────────
-                    (df5, df15, df30, df1h, df4h, df1d) = await asyncio.gather(
-                        self.fetcher.fetch_ohlcv(sym, "5m",  100),
-                        self.fetcher.fetch_ohlcv(sym, "15m", 100),
-                        self.fetcher.fetch_ohlcv(sym, "30m", 60),
-                        self.fetcher.fetch_ohlcv(sym, "1h",  100),
-                        self.fetcher.fetch_ohlcv(sym, "4h",  100),
-                        self.fetcher.fetch_ohlcv(sym, "1d",  60),
-                    )
-                    if df5 is None or len(df5) < 50:
-                        return None
-                    if df15 is None or len(df15) < 20:
-                        df15 = df5
-
-                    # ── [A] ULTRA score (full 6 TF) ────────────────────────
-                    sig = score_symbol(
-                        sym,
-                        df_5m=df5, df_15m=df15, df_30m=df30,
-                        df_1h=df1h, df_4h=df4h, df_1d=df1d,
-                    )
-                    ultra_max = max(
-                        sig.ultra_buy_score,  sig.ultra_sell_score,
-                        sig.ultra_1h_buy,     sig.ultra_1h_sell,
-                        sig.ultra_4h_buy,     sig.ultra_4h_sell,
-                        sig.ultra_1d_buy,     sig.ultra_1d_sell,
-                    )
-                    # Bỏ qua token quá yếu (không đủ điều kiện lệnh nào)
-                    if ultra_max < 6 and sig.score < 5:
-                        return None
-
-                    cur_price = sig.price
-                    if cur_price <= 0 and df15 is not None:
-                        cur_price = float(df15["close"].iloc[-1])
-
-                    # ── [B] FVG scan — thử cả 3 TF mỗi chiều ──────────────
-                    # Chọn df theo TF
-                    fvg_data = {"1h": df1h, "4h": df4h, "1d": df1d}
-                    score_df_map = {"15m": df15, "1h": df1h}
-
-                    best_fvg: Optional[dict] = None   # dict chứa kết quả FVG tốt nhất
-                    best_direction = "neutral"
-
-                    for fvg_tf, score_tf in [("4h", "15m"), ("1h", "15m"), ("1d", "1h")]:
-                        df_fvg   = fvg_data.get(fvg_tf)
-                        df_score = score_df_map.get(score_tf, df15)
-                        if df_fvg is None or len(df_fvg) < 3:
-                            continue
-                        if df_score is None or len(df_score) < 50:
-                            continue
-
-                        BUFFER = BUFFER_MAP.get(fvg_tf, 0.005)
-                        fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
-                        cur = fvg_res["cur_price"]
-                        if cur <= 0:
-                            continue
-
-                        # Thử Bull FVG (LONG setup)
-                        bull_fvgs = fvg_res["bull_fvgs"]
-                        ifvg_bear_sup = [f for f in fvg_res["ifvgs"]
-                                         if f.get("status", "") == "ifvg_bear"]
-                        bull_candidates = [(f, "bull") for f in bull_fvgs] + \
-                                          [(f, "ifvg_bear") for f in ifvg_bear_sup]
-
-                        for fvg, ftype in bull_candidates:
-                            top_buf = fvg["top"]    * (1 + BUFFER)
-                            bot_buf = fvg["bottom"] * (1 - BUFFER)
-                            if not (bot_buf <= cur <= top_buf):
-                                continue
-
-                            kwargs   = self._score_kwargs(score_tf, df_score, fvg_tf, df_fvg)
-                            res_buy  = score_symbol(sym, **kwargs)
-                            buy_sc   = res_buy.ultra_buy_score
-                            if buy_sc < 6:
-                                continue
-
-                            # Freshness
-                            prev_sc = 0
-                            if len(df_score) > FRESH_LOOKBACK + 50:
-                                df_prev  = df_score.iloc[:-FRESH_LOOKBACK]
-                                kw_prev  = self._score_kwargs(score_tf, df_prev, fvg_tf, df_fvg)
-                                prev_sc  = score_symbol(sym, **kw_prev).ultra_buy_score
-                            fresh = prev_sc < 6
-
-                            last_c  = df_score.iloc[-1]
-                            candle_ok = float(last_c["close"]) > float(last_c["open"])
-
-                            sweep_r  = detect_liquidity_sweep(df_score)
-                            liq_ok   = sweep_r["swept"] and sweep_r["sweep_type"] == "low"
-                            choch_r  = detect_choch(df_score)
-                            choch_ok = choch_r["choch_detected"] and choch_r["choch_type"] == "bull"
-
-                            mid  = (fvg["top"] + fvg["bottom"]) / 2
-                            dist = abs(cur - mid) / mid * 100 if mid > 0 else 99
-                            inside = fvg["bottom"] <= cur <= fvg["top"]
-
-                            vol_r  = detect_vol_spike_at_fvg(df_score, fvg["top"], fvg["bottom"])
-                            rr_r   = calc_fvg_rr(df_score, cur, fvg["top"], fvg["bottom"], "buy")
-
-                            if liq_ok and choch_ok and fresh and candle_ok:
-                                status = "🎰SNIPER"
-                            elif fresh and candle_ok:
-                                status = "🎯FRESH+CNF"
-                            elif fresh:
-                                status = "🆕FRESH"
-                            elif candle_ok:
-                                status = "✅CONFIRM"
-                            else:
-                                status = "📊ACTIVE"
-
-                            tier = "🔥" if buy_sc >= 9 and inside else ("⚡" if buy_sc >= 8 else "📌")
-                            fvg_info = {
-                                "direction": "LONG", "fvg_tf": fvg_tf, "score_tf": score_tf,
-                                "fvg_type": ftype, "fvg_top": fvg["top"], "fvg_bot": fvg["bottom"],
-                                "fvg_mid": round(mid, 6), "gap_pct": fvg["gap_pct"],
-                                "dist_pct": round(dist, 2), "inside": inside, "age_bars": fvg["age_bars"],
-                                "fvg_score": buy_sc, "prev_score": prev_sc,
-                                "signal_fresh": fresh, "candle_confirms": candle_ok,
-                                "signal_status": status, "tier": tier,
-                                "liq_swept": liq_ok, "liq_eq_type": sweep_r.get("eq_type", ""),
-                                "liq_level": sweep_r.get("sweep_level", 0.0),
-                                "liq_bars_ago": sweep_r.get("bars_ago", 0),
-                                "choch_ok": choch_ok, "choch_level": choch_r.get("choch_level", 0.0),
-                                "choch_bars_ago": choch_r.get("bars_ago", 0),
-                                "vol_spike": vol_r["vol_spike"], "vol_ratio": vol_r.get("vol_ratio", 1.0),
-                                "rr": rr_r.get("rr", 0.0), "rr_ok": rr_r["rr_ok"],
-                                "sl_price": rr_r.get("sl_price", 0.0), "tp_price": rr_r.get("tp_price", 0.0),
-                                "sl_pct": rr_r.get("sl_pct", 0.0), "tp_pct": rr_r.get("tp_pct", 0.0),
-                            }
-                            # Giữ FVG tốt nhất (score cao + gần mid)
-                            if best_fvg is None or buy_sc > best_fvg["fvg_score"] or \
-                               (buy_sc == best_fvg["fvg_score"] and dist < best_fvg["dist_pct"]):
-                                best_fvg = fvg_info
-                                best_direction = "LONG"
-
-                        # Thử Bear FVG (SHORT setup)
-                        bear_fvgs = fvg_res["bear_fvgs"]
-                        ifvg_bull_res = [f for f in fvg_res["ifvgs"]
-                                         if f.get("status", "") == "ifvg_bull"]
-                        bear_candidates = [(f, "bear") for f in bear_fvgs] + \
-                                          [(f, "ifvg_bull") for f in ifvg_bull_res]
-
-                        for fvg, ftype in bear_candidates:
-                            top_buf = fvg["top"]    * (1 + BUFFER)
-                            bot_buf = fvg["bottom"] * (1 - BUFFER)
-                            if not (bot_buf <= cur <= top_buf):
-                                continue
-
-                            kwargs    = self._score_kwargs(score_tf, df_score, fvg_tf, df_fvg)
-                            res_sell  = score_symbol(sym, **kwargs)
-                            sell_sc   = res_sell.ultra_sell_score
-                            if sell_sc < 6:
-                                continue
-
-                            prev_sc = 0
-                            if len(df_score) > FRESH_LOOKBACK + 50:
-                                df_prev  = df_score.iloc[:-FRESH_LOOKBACK]
-                                kw_prev  = self._score_kwargs(score_tf, df_prev, fvg_tf, df_fvg)
-                                prev_sc  = score_symbol(sym, **kw_prev).ultra_sell_score
-                            fresh = prev_sc < 6
-
-                            last_c  = df_score.iloc[-1]
-                            candle_ok = float(last_c["close"]) < float(last_c["open"])
-
-                            sweep_r  = detect_liquidity_sweep(df_score)
-                            liq_ok   = sweep_r["swept"] and sweep_r["sweep_type"] == "high"
-                            choch_r  = detect_choch(df_score)
-                            choch_ok = choch_r["choch_detected"] and choch_r["choch_type"] == "bear"
-
-                            mid  = (fvg["top"] + fvg["bottom"]) / 2
-                            dist = abs(cur - mid) / mid * 100 if mid > 0 else 99
-                            inside = fvg["bottom"] <= cur <= fvg["top"]
-
-                            vol_r  = detect_vol_spike_at_fvg(df_score, fvg["top"], fvg["bottom"])
-                            rr_r   = calc_fvg_rr(df_score, cur, fvg["top"], fvg["bottom"], "sell")
-
-                            if liq_ok and choch_ok and fresh and candle_ok:
-                                status = "🎰SNIPER"
-                            elif fresh and candle_ok:
-                                status = "🎯FRESH+CNF"
-                            elif fresh:
-                                status = "🆕FRESH"
-                            elif candle_ok:
-                                status = "✅CONFIRM"
-                            else:
-                                status = "📊ACTIVE"
-
-                            tier = "🔥" if sell_sc >= 9 and inside else ("⚡" if sell_sc >= 8 else "📌")
-                            fvg_info = {
-                                "direction": "SHORT", "fvg_tf": fvg_tf, "score_tf": score_tf,
-                                "fvg_type": ftype, "fvg_top": fvg["top"], "fvg_bot": fvg["bottom"],
-                                "fvg_mid": round(mid, 6), "gap_pct": fvg["gap_pct"],
-                                "dist_pct": round(dist, 2), "inside": inside, "age_bars": fvg["age_bars"],
-                                "fvg_score": sell_sc, "prev_score": prev_sc,
-                                "signal_fresh": fresh, "candle_confirms": candle_ok,
-                                "signal_status": status, "tier": tier,
-                                "liq_swept": liq_ok, "liq_eq_type": sweep_r.get("eq_type", ""),
-                                "liq_level": sweep_r.get("sweep_level", 0.0),
-                                "liq_bars_ago": sweep_r.get("bars_ago", 0),
-                                "choch_ok": choch_ok, "choch_level": choch_r.get("choch_level", 0.0),
-                                "choch_bars_ago": choch_r.get("bars_ago", 0),
-                                "vol_spike": vol_r["vol_spike"], "vol_ratio": vol_r.get("vol_ratio", 1.0),
-                                "rr": rr_r.get("rr", 0.0), "rr_ok": rr_r["rr_ok"],
-                                "sl_price": rr_r.get("sl_price", 0.0), "tp_price": rr_r.get("tp_price", 0.0),
-                                "sl_pct": rr_r.get("sl_pct", 0.0), "tp_pct": rr_r.get("tp_pct", 0.0),
-                            }
-                            if best_fvg is None or sell_sc > best_fvg["fvg_score"] or \
-                               (sell_sc == best_fvg["fvg_score"] and dist < best_fvg["dist_pct"]):
-                                best_fvg = fvg_info
-                                best_direction = "SHORT"
-
-                    # ── [C-F] Composite score ──────────────────────────────
-                    # [A] ULTRA max × 4
-                    part_a = ultra_max * 4
-
-                    # [B] FVG tier × 3
-                    STATUS_RANK = {
-                        "🎰SNIPER": 5, "🎯FRESH+CNF": 4, "🆕FRESH": 3,
-                        "✅CONFIRM": 2, "📊ACTIVE": 1,
-                    }
-                    fvg_tier_val = STATUS_RANK.get(
-                        best_fvg["signal_status"], 0) if best_fvg else 0
-                    part_b = fvg_tier_val * 3
-
-                    # [C] Confluence: Sweep + CHoCH + VolSpike + RR_ok
-                    if best_fvg:
-                        confluence = (
-                            int(best_fvg["liq_swept"]) +
-                            int(best_fvg["choch_ok"])  +
-                            int(best_fvg["vol_spike"]) +
-                            int(best_fvg["rr_ok"])
-                        )
-                    else:
-                        confluence = 0
-                    part_c = confluence * 3
-
-                    # [D] SXL score × 1
-                    part_d = sig.score
-
-                    # [E] Bonus
-                    part_e = (2 if sig.is_premium else 0) + (1 if sig.vol_confirm else 0)
-
-                    # [F] RR bonus
-                    rr_val = best_fvg["rr"] if best_fvg else 0.0
-                    part_f = min(rr_val * 2, 8)
-
-                    raw_score = part_a + part_b + part_c + part_d + part_e + part_f
-                    composite  = round(raw_score * 100 / 92, 1)
-
-                    # Xác định hướng cuối: ưu tiên FVG, fallback ULTRA
-                    if best_fvg:
-                        final_dir = best_fvg["direction"]
-                    elif sig.ultra_buy_score > sig.ultra_sell_score:
-                        final_dir = "LONG"
-                    elif sig.ultra_sell_score > sig.ultra_buy_score:
-                        final_dir = "SHORT"
-                    else:
-                        final_dir = sig.direction
-
-                    return {
-                        # ── Identity ────────────────────────────────────────
-                        "symbol":       sym,
-                        "direction":    final_dir,
-                        "cur_price":    cur_price,
-                        "composite":    composite,
-                        # ── Score components ────────────────────────────────
-                        "ultra_max":    ultra_max,
-                        "ultra_15m_b":  sig.ultra_buy_score,
-                        "ultra_15m_s":  sig.ultra_sell_score,
-                        "ultra_1h_b":   sig.ultra_1h_buy,
-                        "ultra_1h_s":   sig.ultra_1h_sell,
-                        "ultra_4h_b":   sig.ultra_4h_buy,
-                        "ultra_4h_s":   sig.ultra_4h_sell,
-                        "ultra_1d_b":   sig.ultra_1d_buy,
-                        "ultra_1d_s":   sig.ultra_1d_sell,
-                        "sxl_score":    sig.score,
-                        "is_premium":   sig.is_premium,
-                        "vol_confirm":  sig.vol_confirm,
-                        "leverage":     sig.leverage,
-                        "lev_risk":     sig.lev_risk,
-                        "atr_pct":      sig.atr_pct,
-                        "zone":         sig.zone,
-                        "ultra_verdict": (
-                            sig.ultra_verdict if final_dir != "SHORT"
-                            else sig.ultra_verdict
-                        ),
-                        "ultra_1h_verdict": sig.ultra_1h_verdict,
-                        "ultra_4h_verdict": sig.ultra_4h_verdict,
-                        "ultra_1d_verdict": sig.ultra_1d_verdict,
-                        "confluence":   confluence,
-                        "part_a":       part_a,
-                        "part_b":       part_b,
-                        "part_c":       part_c,
-                        "part_d":       part_d,
-                        "part_e":       part_e,
-                        "part_f":       round(part_f, 1),
-                        # ── Best FVG (nếu có) ────────────────────────────────
-                        "has_fvg":      best_fvg is not None,
-                        **(best_fvg if best_fvg else {
-                            "signal_status": "📊ACTIVE", "tier": "📌",
-                            "fvg_tf": "—", "score_tf": "—",
-                            "fvg_score": 0, "dist_pct": 99.0, "inside": False,
-                            "signal_fresh": False, "candle_confirms": False,
-                            "liq_swept": False, "choch_ok": False,
-                            "vol_spike": False, "vol_ratio": 1.0,
-                            "rr": 0.0, "rr_ok": False,
-                            "sl_price": 0.0, "tp_price": 0.0,
-                            "sl_pct": 0.0, "tp_pct": 0.0,
-                            "fvg_top": 0.0, "fvg_bot": 0.0, "fvg_mid": 0.0,
-                            "liq_level": 0.0, "liq_bars_ago": 0,
-                            "choch_level": 0.0, "choch_bars_ago": 0,
-                            "fvg_type": "—", "age_bars": 0, "gap_pct": 0.0,
-                        }),
-                    }
-                except Exception as e:
-                    logger.debug(f"composite {sym}: {e}")
-                    return None
-
-        results = await asyncio.gather(*[_analyse(s) for s in symbols])
-        hits = [r for r in results if r is not None]
-        hits.sort(key=lambda x: x["composite"], reverse=True)
-        logger.info(f"[/top] Composite done: {len(hits)} tokens")
-        return hits
-
-    # ──────────────────────────────────────────────────────────────────────
     # PUBLIC WRAPPERS — mỗi lệnh bot gọi 1 trong các hàm này
     # ──────────────────────────────────────────────────────────────────────
 
@@ -1014,3 +657,130 @@ class Scanner:
     # /fb1d — Bull FVG 1d  + 1h  BUY   (khung daily → dùng 1h score)
     async def scan_fb1d(self) -> list[dict]:
         return await self._scan_bull_fvg("1d",  "1h")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # /4h — EMA Cross BUY (Indicator 1) + LinReg xanh (Indicator 2) trên 4h
+    # Điều kiện:
+    #   ① EMA 5/13 vừa cross lên (trendChange) + nến bullish xác nhận
+    #   ② Linear Regression channel 4h có slope > 0 (màu xanh)
+    #
+    # Kết quả mỗi hit dict:
+    #   symbol, cur_price
+    #   ema_fast, ema_slow              — giá trị EMA hiện tại
+    #   entry_price, stop_loss, take_profit, risk
+    #   linreg_bull, slope_pct          — slope LR (%)
+    #   linreg_val, upper_band, lower_band
+    #   overextended_up/down
+    #   price_vs_linreg                 — % giá so với đường LR
+    #   rr                              — risk:reward tự tính
+    #   tier                            — 🔥/⚡/📌 theo chất lượng
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def scan_4h_confluence(
+        self,
+        ema_fast:    int   = 5,
+        ema_slow:    int   = 13,
+        lr_length:   int   = 50,
+        lr_mult:     float = 2.0,
+        atr_mult_sl: float = 0.5,
+        risk_reward: float = 3.0,
+    ) -> list[dict]:
+        """
+        Quét toàn market tìm 4h có:
+          - EMA 5/13 vừa cross lên + nến bullish xác nhận   (Indicator 1)
+          - LinReg channel slope > 0 (màu xanh)              (Indicator 2)
+
+        Không yêu cầu ULTRA score — chỉ dựa trên 2 indicator trên.
+        Có thêm RR check để lọc setup rủi ro xấu.
+        """
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(f"4H Confluence scan: {len(symbols)} symbols")
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def _check_one(sym: str) -> Optional[dict]:
+            async with sem:
+                try:
+                    df4h = await self.fetcher.fetch_ohlcv(sym, "4h", limit=100)
+                    if df4h is None or len(df4h) < max(ema_slow, lr_length) + 10:
+                        return None
+
+                    # ── Indicator 1: EMA Crossover BUY ──────────────────
+                    ema_res = ema_crossover_signal(
+                        df4h,
+                        ema_fast_len   = ema_fast,
+                        ema_slow_len   = ema_slow,
+                        atr_mult_sl    = atr_mult_sl,
+                        risk_reward    = risk_reward,
+                        confirm_candle = True,
+                    )
+                    if not ema_res["buy_signal"]:
+                        return None
+
+                    # ── Indicator 2: LinReg Channel slope xanh ──────────
+                    lr_res = linreg_channel(df4h, length=lr_length, mult=lr_mult)
+                    if not lr_res["linreg_bull"]:
+                        return None
+
+                    # ── Thông tin bổ sung ────────────────────────────────
+                    cur_price   = ema_res["entry_price"]
+                    entry       = ema_res["entry_price"]
+                    sl          = ema_res["stop_loss"]
+                    tp          = ema_res["take_profit"]
+                    risk        = ema_res["risk"]
+                    reward      = abs(tp - entry)
+                    rr          = round(reward / risk, 2) if risk > 0 else 0.0
+
+                    # Tier: dựa vào slope strength + không overextended
+                    slope_abs = abs(lr_res["slope_pct"])
+                    not_over  = not lr_res["overextended_up"]
+                    if slope_abs >= 0.05 and not_over:
+                        tier = "🔥"
+                    elif slope_abs >= 0.02 or not_over:
+                        tier = "⚡"
+                    else:
+                        tier = "📌"
+
+                    return {
+                        "symbol":           sym,
+                        "cur_price":        cur_price,
+                        # EMA
+                        "ema_fast":         ema_res["ema_fast"],
+                        "ema_slow":         ema_res["ema_slow"],
+                        "fresh_cross":      ema_res["fresh_cross"],
+                        # Trade levels
+                        "entry_price":      entry,
+                        "stop_loss":        sl,
+                        "take_profit":      tp,
+                        "risk":             risk,
+                        "rr":               rr,
+                        # LinReg
+                        "linreg_bull":      lr_res["linreg_bull"],
+                        "slope_pct":        lr_res["slope_pct"],
+                        "linreg_val":       lr_res["linreg_val"],
+                        "upper_band":       lr_res["upper_band"],
+                        "lower_band":       lr_res["lower_band"],
+                        "overextended_up":  lr_res["overextended_up"],
+                        "overextended_down": lr_res["overextended_down"],
+                        "price_vs_linreg":  lr_res["price_vs_linreg"],
+                        # Display
+                        "tier":             tier,
+                    }
+
+                except Exception as e:
+                    logger.debug(f"scan_4h_confluence {sym}: {e}")
+                    return None
+
+        results = await asyncio.gather(*[_check_one(s) for s in symbols])
+        hits    = [r for r in results if r is not None]
+
+        # Sort: tier trước, rồi slope mạnh nhất, rồi không overextended
+        TIER_RANK = {"🔥": 0, "⚡": 1, "📌": 2}
+        hits.sort(key=lambda x: (
+            TIER_RANK.get(x["tier"], 9),
+            -abs(x["slope_pct"]),
+            x["overextended_up"],
+        ))
+
+        logger.info(f"/4h scan done: {len(hits)} tokens (EMA cross + LinReg bull, 4H)")
+        return hits
