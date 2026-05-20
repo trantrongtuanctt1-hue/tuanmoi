@@ -1,1048 +1,1016 @@
 """
-Telegram bot v3.0
-Commands: /scan /top /check /status /debug /source /help
-
-Dashboard đầy đủ:
-  ① SXL Sniper (5 confluences Long/Short)
-  ② MSB-OB + Vol Balance + Spike + Leverage  (giữ từ v2)
-  ③ 15M ULTRA panel (NEW):
-       ST AI | UT Bot | SAR | SMC Swing | SMC Internal
-       Zone (PREM/EQ↑/EQ/EQ↓/DISC)
-       RSI MTF (6 TF)
-       MTF 3 tầng (Momentum 5m / Bridge 30m / Context 1h+4h+1d)
-       ULTRA Score 0–11 → Verdict
+Scanner — quét tối đa 500 token song song
+v3.2:
+  - Ngưỡng pass: ultra_buy hoặc ultra_sell >= 8
+  - scan_all()       → trả TẤT CẢ đủ điều kiện, KHÔNG áp cooldown (dùng cho /scan manual)
+  - scan_for_alert() → áp cooldown 15 phút (dùng cho auto alert 5 phút)
+  - scan_symbol()    → quét 1 token, không cooldown, không ngưỡng
 """
+import asyncio
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import time
+from typing import Optional
 
-from scanner import Scanner
-from signals import SignalResult, detect_fvg
+from fetcher import BybitFetcher
+from signals import (
+    SignalResult, score_symbol, detect_fvg,
+    detect_liquidity_sweep, detect_choch,
+    detect_vol_spike_at_fvg, calc_fvg_rr,
+)
 
 logger = logging.getLogger(__name__)
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# FORMAT HELPERS
-# ══════════════════════════════════════════════════════════════════════════
-
-def _yn(v: bool) -> str:
-    return "✓" if v else "✗"
-
-def _arr(v: int | bool) -> str:
-    """1/True→▲  -1/False→▼  0→●"""
-    if v is True  or v == 1:  return "▲"
-    if v is False or v == -1: return "▼"
-    return "●"
-
-def _rsi_bar(bull: int, bear: int) -> str:
-    """Tạo thanh RSI MTF 6 ô, ví dụ ▲▲▲▼●●"""
-    # placeholder: chỉ hiển thị count
-    return f"▲{bull}/6  ▼{bear}/6"
-
-def _score_bar(n: int, total: int = 6) -> str:
-    filled = min(n, total)
-    return "█" * filled + "░" * (total - filled)
-
-def _mtf_line(momentum_b, momentum_bm, bridge_b, bridge_bm, ctx_b, ctx_bm) -> str:
-    def _flag(bull, bear):
-        if bull: return "✅"
-        if bear: return "🔴"
-        return "⬜"
-    return (
-        f"5m{_flag(momentum_b, momentum_bm)} "
-        f"30m{_flag(bridge_b,   bridge_bm)} "
-        f"1h+4h+1d{_flag(ctx_b, ctx_bm)}"
-    )
+COOLDOWN_SECONDS = 900   # 15 phút, chỉ dùng cho auto alert
+CONCURRENCY      = 30
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# FORMAT FULL (dùng cho /check và /scan)
-# ══════════════════════════════════════════════════════════════════════════
+class Scanner:
+    def __init__(
+        self,
+        fetcher: BybitFetcher,
+        min_score: int = 8,       # ultra score threshold, đọc từ env MIN_ALERT_SCORE
+        max_symbols: int = 1000,
+    ):
+        self.fetcher      = fetcher
+        self.min_score    = min_score
+        self.max_symbols  = max_symbols
+        self._last_alert: dict[str, float] = {}
 
-def _fmt(r: SignalResult) -> str:
-    dir_emoji = "🟢" if r.direction == "LONG" else ("🔴" if r.direction == "SHORT" else "⚪")
-    premium_line = f"⭐ *PREMIUM SIGNAL*\n" if r.is_premium else ""
+    def _in_cooldown(self, symbol: str) -> bool:
+        last = self._last_alert.get(symbol, 0)
+        return (time.time() - last) < COOLDOWN_SECONDS
 
-    spike_line = (
-        f"⚡ *Spike {'▲' if r.spike_direction == 'BULL' else '▼'} {r.spike_pct}%* — Cẩn thận!\n"
-        if r.is_spike else f"⚡ Spike: OK ({r.spike_pct}%)\n"
-    )
+    def _mark_alert(self, symbol: str):
+        self._last_alert[symbol] = time.time()
 
-    vol_icon    = "📈" if r.bull_pct > r.bear_pct else "📉"
-    vol_dom     = " ⚠️ Dominant" if max(r.bull_pct, r.bear_pct) >= 65 else ""
-    vol_conf    = "✓ Confirms" if r.vol_confirm else "✗ Against"
-    lev_bar     = "█" * min(r.leverage, 10) + "░" * max(0, 10 - r.leverage)
-    tags        = " | ".join(r.reasons[:8]) if r.reasons else "—"
-
-    # ── UT Bot text ──────────────────────────────────────────────────────
-    ut_txt = "LONG" if r.ut_pos_val == 1 else ("SHORT" if r.ut_pos_val == -1 else "FLAT")
-
-    # ── Zone color hint ──────────────────────────────────────────────────
-    zone_icon = {
-        "PREM": "🔴", "EQ↑": "🟡", "EQ": "⚪",
-        "EQ↓":  "🟡", "DISC": "🟢",
-    }.get(r.zone, "⚪")
-
-    # ── RSI bar ──────────────────────────────────────────────────────────
-    rsi_bar = _rsi_bar(r.rsi_bull_count, r.rsi_bear_count)
-
-    # ── MTF 3 tầng ───────────────────────────────────────────────────────
-    mtf_txt = _mtf_line(
-        r.mtf_momentum_bull, r.mtf_momentum_bear,
-        r.mtf_bridge_bull,   r.mtf_bridge_bear,
-        r.mtf_context_bull,  r.mtf_context_bear,
-    )
-
-    # ── Ultra score bar (15m) ─────────────────────────────────────────────
-    ultra_max    = max(r.ultra_buy_score, r.ultra_sell_score)
-    ultra_bar    = "█" * ultra_max + "░" * (11 - ultra_max)
-    ultra_side   = "↑" if r.ultra_buy_score >= r.ultra_sell_score else "↓"
-    ultra_color  = "🟢" if r.ultra_verdict_color == "green" else ("🔴" if r.ultra_verdict_color == "red" else "⬜")
-
-    # ── Ultra 1h / 4h ────────────────────────────────────────────────────
-    def _uc(color): return "🟢" if color == "green" else ("🔴" if color == "red" else "⬜")
-    def _ubar(b, s): m = max(b, s); return "█" * m + "░" * (11 - m)
-
-    u1h_color = _uc(r.ultra_1h_color)
-    u4h_color = _uc(r.ultra_4h_color)
-    u1d_color = _uc(r.ultra_1d_color)
-    u1h_bar   = _ubar(r.ultra_1h_buy, r.ultra_1h_sell)
-    u4h_bar   = _ubar(r.ultra_4h_buy, r.ultra_4h_sell)
-    u1d_bar   = _ubar(r.ultra_1d_buy, r.ultra_1d_sell)
-
-    msg = (
-        f"{dir_emoji} *{r.symbol}*  [{r.direction}]  SXL: *{r.score}/10*\n"
-        f"{premium_line}"
-        f"{'─' * 30}\n"
-        f"💰 Price  : `{r.price}`\n"
-        f"🛑 SL     : `{r.sl}`\n"
-        f"🎯 TP1    : `{r.tp1}`\n"
-        f"🎯 TP2    : `{r.tp2}`\n"
-        f"{'─' * 30}\n"
-        f"📐 *SXL Confluences*\n"
-        f"  LONG {r.l_score}/5 | SHORT {r.s_score}/5\n"
-        f"  MSB Bias: {r.market_bias} | OB/BB Zone: {_yn(r.in_ob_zone)}\n"
-        f"{'─' * 30}\n"
-        f"⚡ *15M ULTRA Indicators*\n"
-        f"  ST-AI : {_arr(r.st_ai_bull)} (factor {r.st_ai_factor:.1f})\n"
-        f"  UT Bot: {_arr(r.ut_pos_val)} ({ut_txt})\n"
-        f"  SAR   : {_arr(r.sar_bull_val)}\n"
-        f"  SMC Sw: {_arr(r.smc_swing_bull)} | SMC In: {_arr(r.smc_int_bull)}\n"
-        f"  Zone  : {zone_icon} *{r.zone}* ({r.zone_pct}%)\n"
-        f"{'─' * 30}\n"
-        f"📊 *RSI MTF*  {rsi_bar}\n"
-        f"{'─' * 30}\n"
-        f"🔗 *MTF 3 Tầng*\n"
-        f"  {mtf_txt}\n"
-        f"{'─' * 30}\n"
-        f"🏆 *ULTRA Score (15m)*\n"
-        f"  {ultra_color} BUY {r.ultra_buy_score}↑ / SELL {r.ultra_sell_score}↓ /11\n"
-        f"  `{ultra_bar}` {ultra_side}\n"
-        f"  Verdict: *{r.ultra_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"⏱ *ULTRA Score 1H*\n"
-        f"  {u1h_color} BUY {r.ultra_1h_buy}↑ / SELL {r.ultra_1h_sell}↓ /11\n"
-        f"  `{u1h_bar}`\n"
-        f"  Verdict: *{r.ultra_1h_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"⏱ *ULTRA Score 4H*\n"
-        f"  {u4h_color} BUY {r.ultra_4h_buy}↑ / SELL {r.ultra_4h_sell}↓ /11\n"
-        f"  `{u4h_bar}`\n"
-        f"  Verdict: *{r.ultra_4h_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"📅 *ULTRA Score 1D*\n"
-        f"  {u1d_color} BUY {r.ultra_1d_buy}↑ / SELL {r.ultra_1d_sell}↓ /11\n"
-        f"  `{u1d_bar}`\n"
-        f"  Verdict: *{r.ultra_1d_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"{vol_icon} *Volume Balance*\n"
-        f"  ▲ Bull: {r.bull_pct}%  |  ▼ Bear: {r.bear_pct}%{vol_dom}\n"
-        f"  Vol {vol_conf}\n"
-        f"{'─' * 30}\n"
-        f"{spike_line}"
-        f"{'─' * 30}\n"
-        f"🎚 *Leverage Advisor*\n"
-        f"  Gợi ý: *{r.leverage}x*  {r.lev_risk}\n"
-        f"  ATR% = {r.atr_pct}%  [{lev_bar}]\n"
-        f"{'─' * 30}\n"
-        f"📌 {tags}"
-    )
-    return msg
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# FORMAT SHORT (dùng cho /top)
-# ══════════════════════════════════════════════════════════════════════════
-
-def _fmt_short(r: SignalResult) -> str:
-    dir_emoji = "🟢" if r.direction == "LONG" else ("🔴" if r.direction == "SHORT" else "⚪")
-    prem  = " ★"           if r.is_premium else ""
-    spk   = f" ⚡{r.spike_pct}%" if r.is_spike else ""
-    vc    = r.ultra_verdict_color
-    v_em  = "🟢" if vc == "green" else ("🔴" if vc == "red" else "⬜")
-    zone_icon = {
-        "PREM": "🔴", "EQ↑": "🟡", "EQ": "⚪", "EQ↓": "🟡", "DISC": "🟢",
-    }.get(r.zone, "⚪")
-    ut_txt = "L" if r.ut_pos_val == 1 else ("S" if r.ut_pos_val == -1 else "—")
-    mtf_ctx = "✅" if (r.mtf_context_bull or r.mtf_context_bear) else "⬜"
-
-    def _uc(c): return "🟢" if c == "green" else ("🔴" if c == "red" else "⬜")
-    u1h_em = _uc(r.ultra_1h_color)
-    u4h_em = _uc(r.ultra_4h_color)
-    u1d_em = _uc(r.ultra_1d_color)
-
-    return (
-        f"{dir_emoji} *{r.symbol}*{prem}  SXL:`{r.score}/10`  15m:`{r.ultra_buy_score}↑{r.ultra_sell_score}↓`{spk}\n"
-        f"  {v_em} *{r.ultra_verdict}*  "
-        f"1H:{u1h_em}`{r.ultra_1h_buy}↑{r.ultra_1h_sell}↓` *{r.ultra_1h_verdict}*\n"
-        f"  4H:{u4h_em}`{r.ultra_4h_buy}↑{r.ultra_4h_sell}↓` *{r.ultra_4h_verdict}*  "
-        f"1D:{u1d_em}`{r.ultra_1d_buy}↑{r.ultra_1d_sell}↓` *{r.ultra_1d_verdict}*\n"
-        f"  ST-AI:{_arr(r.st_ai_bull)} UT:{ut_txt} SAR:{_arr(r.sar_bull_val)} "
-        f"Zone:{zone_icon}{r.zone}({r.zone_pct}%) CTX:{mtf_ctx}\n"
-        f"  RSI▲{r.rsi_bull_count}/6 ▼{r.rsi_bear_count}/6 | "
-        f"Vol▲{r.bull_pct}%/▼{r.bear_pct}% | Lev:{r.leverage}x {r.lev_risk}\n"
-        f"  💰`{r.price}` 🛑`{r.sl}` 🎯`{r.tp1}`"
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# BOT
-# ══════════════════════════════════════════════════════════════════════════
-
-class TelegramBot:
-    def __init__(self, token: str, scanner: Scanner):
-        self.token   = token
-        self.scanner = scanner
-        self.app     = Application.builder().token(token).build()
-        for cmd, fn in [
-            ("start",    self._start),
-            ("help",     self._help),
-            ("scan",     self._scan),
-            ("top",      self._top),
-            ("strong",   self._strong),
-            ("fvg",      self._fvg),
-            ("fvgscan",  self._fvgscan),
-            ("ft",       self._ft),
-            ("ft1h",     self._ft1h),
-            ("ft1d",     self._ft1d),
-            ("fb",       self._fb),
-            ("fb1h",     self._fb1h),
-            ("fb1d",     self._fb1d),
-            ("check",    self._check),
-            ("status",   self._status),
-            ("debug",    self._debug),
-            ("source",   self._source),
-        ]:
-            self.app.add_handler(CommandHandler(cmd, fn))
-
-    async def _start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text(
-            "🤖 *SXL Sniper + 15M ULTRA Bot* v3.0 sẵn sàng!\n"
-            "Dùng /help xem lệnh.",
-            parse_mode="Markdown"
-        )
-
-    async def _help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        lines = (
-            "📖 *Danh sách lệnh*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔍 *Quét toàn market*\n"
-            "/scan    — Quét toàn bộ, liệt kê token ULTRA ≥ 8\n"
-            "/top     — Top signal mạnh nhất hiện tại\n"
-            "/strong  — Token có STRONG signal trên khung 1D\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔴 *Setup SHORT — giá chạm Bear FVG*\n"
-            "_FVG kháng cự + SELL score xác nhận xu hướng giảm_\n"
-            "/ft      — Bear FVG 4h  ×  SELL score 15m\n"
-            "/ft1h    — Bear FVG 1h  ×  SELL score 15m\n"
-            "/ft1d    — Bear FVG 1D  ×  SELL score 1h\n"
-            "_Tier: 🔥 sell≥9+trong  ⚡ sell≥8  📌 sell≥6_\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🟢 *Setup LONG — giá chạm Bull FVG*\n"
-            "_FVG hỗ trợ + BUY score xác nhận xu hướng tăng_\n"
-            "/fb      — Bull FVG 4h  ×  BUY score 15m\n"
-            "/fb1h    — Bull FVG 1h  ×  BUY score 15m\n"
-            "/fb1d    — Bull FVG 1D  ×  BUY score 1h\n"
-            "_Tier: 🔥 buy≥9+trong   ⚡ buy≥8   📌 buy≥6_\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📐 *FVG thủ công*\n"
-            "/fvgscan `[tf]`  — Toàn market đang NẰM TRONG FVG\n"
-            "  tf mặc định: 4h  |  hỗ trợ: 5m 15m 30m 1h 4h 1d\n"
-            "/fvg `BTC [tf]`  — Xem FVG bull/bear/ifvg của 1 token\n"
-            "  ví dụ: /fvg ETH 1h\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔎 *Phân tích 1 token*\n"
-            "/check `BTC`     — Dashboard đầy đủ 6 TF (ULTRA + SXL)\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "⚙️ *Hệ thống*\n"
-            "/status  — Trạng thái bot & cấu hình hiện tại\n"
-            "/debug   — Test kết nối API OKX\n"
-            "/source  — Xem nguồn dữ liệu đang dùng\n"
-        )
-        await u.message.reply_text(lines, parse_mode="Markdown")
-
-    async def _scan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text("🔍 Đang quét token (6 TF/symbol)... (~90s)")
-        signals = await self.scanner.scan_all()
-        if not signals:
-            await u.message.reply_text(
-                "❌ Không có tín hiệu ultra≥8 lúc này.\n"
-                "Dùng /debug để kiểm tra kết nối."
-            )
-            return
-
-        strong   = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
-                                              r.ultra_1h_buy, r.ultra_1h_sell,
-                                              r.ultra_4h_buy, r.ultra_4h_sell,
-                                              r.ultra_1d_buy, r.ultra_1d_sell) >= 9]
-        mid      = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
-                                              r.ultra_1h_buy, r.ultra_1h_sell,
-                                              r.ultra_4h_buy, r.ultra_4h_sell,
-                                              r.ultra_1d_buy, r.ultra_1d_sell) == 8]
-        premiums = [r for r in signals if r.is_premium]
-        spikes   = [r for r in signals if r.is_spike]
-
-        # Gửi summary trước
-        await u.message.reply_text(
-            f"📊 *Kết quả scan* — {len(signals)} tín hiệu (ultra≥8)\n"
-            f"🚀 STRONG (ULTRA≥9): {len(strong)}\n"
-            f"✅ BUY/SELL (ULTRA=8): {len(mid)}\n"
-            f"⭐ Premium: {len(premiums)}  ⚡ Spike: {len(spikes)}\n"
-            f"_(Gửi từng signal bên dưới…)_",
-            parse_mode="Markdown"
-        )
-
-        # Gửi TẤT CẢ signal — full format, không giới hạn số lượng
-        for r in signals:
-            await u.message.reply_text(_fmt(r), parse_mode="Markdown")
-
-        await u.message.reply_text(
-            f"✅ *Xong!* Đã gửi {len(signals)} tín hiệu.",
-            parse_mode="Markdown"
-        )
-
-    async def _top(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /top — Composite scan toàn thị trường.
-        Gộp TẤT CẢ điều kiện (/scan, /fb, /ft, /fb1h, /ft1h, /fb1d, /ft1d):
-          ULTRA score (15m/1h/4h/1d) + FVG (bull/bear × 3TF)
-          + Sweep + CHoCH + VolSpike + RR + SXL + Premium
-        Sort #1 = lệnh chuẩn nhất, lợi nhuận cao nhất.
-        """
-        await u.message.reply_text(
-            "🏆 Đang tính *Composite Score* toàn market (~90–120s)…\n"
-            "_Gộp mọi điều kiện: ULTRA + FVG + Sweep + CHoCH + RR_",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_top_composite()
-        if not hits:
-            await u.message.reply_text("❌ Không có tín hiệu. Dùng /debug kiểm tra.")
-            return
-
-        # Thống kê nhanh
-        long_cnt    = sum(1 for h in hits if h["direction"] == "LONG")
-        short_cnt   = sum(1 for h in hits if h["direction"] == "SHORT")
-        sniper_cnt  = sum(1 for h in hits if h.get("signal_status") == "🎰SNIPER")
-        fvg_cnt     = sum(1 for h in hits if h["has_fvg"])
-        premium_cnt = sum(1 for h in hits if h["is_premium"])
-
-        summary = (
-            f"🏆 *TOP COMPOSITE* — {len(hits)} token\n"
-            f"🟢 LONG:{long_cnt}  🔴 SHORT:{short_cnt}  "
-            f"🎰 Sniper:{sniper_cnt}  📐 FVG:{fvg_cnt}  ⭐ Premium:{premium_cnt}\n"
-            f"_Điểm tổng hợp 0–100: ULTRA×4 + FVG×3 + Confluence×3 + SXL + RR_\n"
-            f"{'─'*30}\n"
-        )
-        await u.message.reply_text(summary, parse_mode="Markdown")
-
-        def _row_top(rank: int, h: dict) -> str:
-            dir_em  = "🟢" if h["direction"] == "LONG" else "🔴"
-            sym     = h["symbol"].replace("USDT", "")
-            prem    = " ⭐" if h["is_premium"] else ""
-            cmp     = h["composite"]
-            badge   = "🚀" if cmp >= 70 else ("✅" if cmp >= 50 else "📊")
-
-            # Dòng 1: rank + symbol + composite + hướng
-            line1 = (
-                f"*#{rank}* {badge} {dir_em} *{sym}*{prem}  "
-                f"Score:`{cmp:.0f}/100`  `{h['cur_price']:.4f}`\n"
+    async def _analyse_one(self, symbol: str, ignore_threshold: bool = False) -> Optional[SignalResult]:
+        """Fetch 6 TF và score. ignore_threshold=True để luôn trả kết quả (dùng cho /check)."""
+        try:
+            df5, df15, df30, df1h, df4h, df1d = await asyncio.gather(
+                self.fetcher.fetch_ohlcv(symbol, "5m",  100),
+                self.fetcher.fetch_ohlcv(symbol, "15m",  60),
+                self.fetcher.fetch_ohlcv(symbol, "30m",  60),
+                self.fetcher.fetch_ohlcv(symbol, "1h",   60),
+                self.fetcher.fetch_ohlcv(symbol, "4h",   60),
+                self.fetcher.fetch_ohlcv(symbol, "1d",   60),
             )
 
-            # Dòng 2: ULTRA breakdown
-            line2 = (
-                f"  ULTRA 15m:`{h['ultra_15m_b']}↑{h['ultra_15m_s']}↓` "
-                f"1h:`{h['ultra_1h_b']}↑{h['ultra_1h_s']}↓` "
-                f"4h:`{h['ultra_4h_b']}↑{h['ultra_4h_s']}↓` "
-                f"1d:`{h['ultra_1d_b']}↑{h['ultra_1d_s']}↓`\n"
+            if df5 is None or len(df5) < 50:
+                return None
+            if df15 is None or len(df15) < 20:
+                df15 = df5
+
+            result = score_symbol(
+                symbol,
+                df_5m  = df5,
+                df_15m = df15,
+                df_1h  = df1h,
+                df_30m = df30,
+                df_4h  = df4h,
+                df_1d  = df1d,
             )
 
-            # Dòng 3: FVG info (nếu có) hoặc ULTRA verdict
-            if h["has_fvg"]:
-                fvg_em  = "🟢" if h["direction"] == "LONG" else "🔴"
-                pos_tag = "✅trong" if h.get("inside") else "🔔gần"
-                status  = h.get("signal_status", "📊ACTIVE")
-                tier    = h.get("tier", "📌")
-                fvg_sc  = h.get("fvg_score", 0)
-                fvg_tf  = h.get("fvg_tf", "—")
-                dist    = h.get("dist_pct", 0.0)
-                line3 = (
-                    f"  {fvg_em}FVG-{fvg_tf} {tier}{status} {pos_tag} "
-                    f"FVGsc:`{fvg_sc}/11`  Cách mid:`{dist:.2f}%`\n"
-                )
-            else:
-                v15 = h.get("ultra_verdict", "")
-                v1h = h.get("ultra_1h_verdict", "")
-                line3 = f"  _ULTRA: {v15} | 1H: {v1h}_\n"
+            if ignore_threshold:
+                return result
 
-            # Dòng 4: Confluence indicators
-            conf_parts = []
-            if h.get("liq_swept"):
-                conf_parts.append(f"💧Sweep({h.get('liq_bars_ago',0)}n)")
-            if h.get("choch_ok"):
-                conf_parts.append(f"🔄CHoCH({h.get('choch_bars_ago',0)}n)")
-            if h.get("vol_spike"):
-                conf_parts.append(f"⚡Vol×{h.get('vol_ratio',1.0):.1f}")
-            rr = h.get("rr", 0.0)
-            rr_em = "🟢" if h.get("rr_ok") else "🟡"
-            conf_parts.append(f"{rr_em}RR:{rr:.1f}")
-            line4 = f"  {' '.join(conf_parts)}\n"
+            # Pass nếu 15m ULTRA >= ngưỡng HOẶC 1h / 4h / 1d có STRONG BUY/SELL
+            ultra_15m = max(result.ultra_buy_score, result.ultra_sell_score)
+            ultra_1h  = max(result.ultra_1h_buy,    result.ultra_1h_sell)
+            ultra_4h  = max(result.ultra_4h_buy,    result.ultra_4h_sell)
+            ultra_1d  = max(result.ultra_1d_buy,    result.ultra_1d_sell)
+            if ultra_15m >= self.min_score or ultra_1h >= self.min_score or ultra_4h >= self.min_score or ultra_1d >= self.min_score:
+                return result
+            return None
 
-            # Dòng 5: SL / TP (nếu có từ FVG)
-            sl_p  = h.get("sl_price", 0.0)
-            tp_p  = h.get("tp_price", 0.0)
-            sl_pc = h.get("sl_pct",   0.0)
-            tp_pc = h.get("tp_pct",   0.0)
-            if sl_p > 0 and tp_p > 0:
-                line5 = (
-                    f"  🛑`{sl_p:.4f}`(-{sl_pc:.2f}%)  "
-                    f"🎯`{tp_p:.4f}`(+{tp_pc:.2f}%)  "
-                    f"SXL:`{h['sxl_score']}/10` Lev:`{h['leverage']}x`\n"
-                )
-            else:
-                line5 = (
-                    f"  SXL:`{h['sxl_score']}/10`  "
-                    f"Lev:`{h['leverage']}x` {h['lev_risk']}\n"
-                )
+        except Exception as e:
+            logger.debug(f"{symbol}: {e}")
+            return None
 
-            return line1 + line2 + line3 + line4 + line5
+    async def _run_scan(self) -> list[SignalResult]:
+        """Core: quét toàn bộ symbols, trả tất cả đủ ngưỡng, sort theo score."""
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(f"Scanning {len(symbols)} symbols (6 TF, ultra>={self.min_score})…")
 
-        # Gom theo chunk
-        chunk = ""
-        for rank, h in enumerate(hits, 1):
-            row = _row_top(rank, h) + "\n"
-            if len(chunk) + len(row) > 3800:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = row
-            else:
-                chunk += row
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
-
-        await u.message.reply_text(
-            f"✅ *Xong!* Top {len(hits)} token theo Composite Score.\n"
-            f"_#1 = chuẩn nhất, lợi nhuận tiềm năng cao nhất_",
-            parse_mode="Markdown"
-        )
-
-    async def _strong(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /strong — hiển thị các token có ULTRA 1D STRONG BUY hoặc STRONG SELL (≥9).
-        Dùng ngưỡng thấp hơn khi scan (bỏ qua min_score bình thường) để không bỏ sót.
-        """
-        await u.message.reply_text("📅 Đang quét 1D STRONG (ultra_1d ≥ 9)... (~90s)")
-
-        # Scan toàn bộ với ignore_threshold để lấy mọi kết quả, sau đó tự lọc
-        symbols = await self.scanner.fetcher.fetch_top_symbols(self.scanner.max_symbols)
-
-        import asyncio
-        from scanner import CONCURRENCY
         sem = asyncio.Semaphore(CONCURRENCY)
 
-        async def _fetch_one(sym):
+        async def limited(sym):
             async with sem:
-                return await self.scanner._analyse_one(sym, ignore_threshold=True)
+                return await self._analyse_one(sym)
 
-        results = await asyncio.gather(*[_fetch_one(s) for s in symbols])
+        results = await asyncio.gather(*[limited(s) for s in symbols])
 
-        # Lọc chỉ giữ token có 1D STRONG BUY hoặc STRONG SELL
-        strong_1d = [
-            r for r in results
-            if r is not None and (r.ultra_1d_buy >= 9 or r.ultra_1d_sell >= 9)
-        ]
-
-        # Sort: 1D score cao nhất trước
-        strong_1d.sort(
-            key=lambda x: max(x.ultra_1d_buy, x.ultra_1d_sell),
+        signals = [r for r in results if r is not None]
+        signals.sort(
+            key=lambda x: (
+                max(x.ultra_buy_score, x.ultra_sell_score,
+                    x.ultra_1h_buy, x.ultra_1h_sell,
+                    x.ultra_4h_buy, x.ultra_4h_sell,
+                    x.ultra_1d_buy, x.ultra_1d_sell),
+                x.score,
+            ),
             reverse=True,
         )
+        logger.info(f"Signals found: {len(signals)}")
+        return signals
 
-        if not strong_1d:
-            await u.message.reply_text(
-                "❌ Không có token nào đạt 1D STRONG (ultra_1d ≥ 9) lúc này.\n"
-                "Dùng /scan để xem tín hiệu ngắn hạn."
-            )
-            return
-
-        buy_cnt  = sum(1 for r in strong_1d if r.ultra_1d_buy >= r.ultra_1d_sell)
-        sell_cnt = len(strong_1d) - buy_cnt
-
-        await u.message.reply_text(
-            f"📅 *1D STRONG* — {len(strong_1d)} token\n"
-            f"🟢 STRONG BUY: {buy_cnt}  |  🔴 STRONG SELL: {sell_cnt}\n"
-            f"_(Gửi từng signal bên dưới…)_",
-            parse_mode="Markdown"
-        )
-
-        for r in strong_1d:
-            # Tạo prefix rõ hướng 1D
-            if r.ultra_1d_buy >= 9 and r.ultra_1d_buy >= r.ultra_1d_sell:
-                label = f"📅🟢 *1D STRONG BUY* — score {r.ultra_1d_buy}/11"
-            else:
-                label = f"📅🔴 *1D STRONG SELL* — score {r.ultra_1d_sell}/11"
-            await u.message.reply_text(
-                f"{label}\n\n{_fmt(r)}",
-                parse_mode="Markdown"
-            )
-
-        await u.message.reply_text(
-            f"✅ *Xong!* Đã gửi {len(strong_1d)} token 1D STRONG.",
-            parse_mode="Markdown"
-        )
-
-    # ── Shared display helper ─────────────────────────────────────────────
-
-    async def _send_fvg_hits(
-        self,
-        u: Update,
-        hits: list[dict],
-        direction: str,   # "sell" hoặc "buy"
-        fvg_tf: str,
-        score_tf: str,
-    ):
+    async def scan_all(self) -> list[SignalResult]:
         """
-        Render và gửi kết quả FVG scan (dùng chung cho /ft* và /fb*).
-        direction : "sell" → Bear FVG / "buy" → Bull FVG
-
-        Ưu tiên hiển thị: 🎰SNIPER > 🎯FRESH+CNF > 🆕FRESH > ✅CONFIRM > 📊ACTIVE
-        (hits đã được scanner sort theo STATUS_RANK trước khi truyền vào)
+        Dùng cho /scan manual.
+        Trả TẤT CẢ signal ultra >= ngưỡng — KHÔNG áp cooldown, KHÔNG đánh dấu cooldown.
         """
-        is_sell   = (direction == "sell")
-        dir_em    = "🔴" if is_sell else "🟢"
-        fvg_lbl   = "Bear FVG" if is_sell else "Bull FVG"
-        setup     = "SHORT"     if is_sell else "LONG"
-        score_key = "sell_score" if is_sell else "buy_score"
-        score_lbl = "SELL"       if is_sell else "BUY"
-        cnf_dir   = "nến bearish↓" if is_sell else "nến bullish↑"
+        signals = await self._run_scan()
+        logger.info(f"/scan → {len(signals)} signals (no cooldown filter)")
+        return signals
 
-        # ── Đếm theo status ─────────────────────────────────────────────────
-        sniper    = [h for h in hits if h.get("signal_status") == "🎰SNIPER"]
-        fresh_cnf = [h for h in hits if h.get("signal_status") == "🎯FRESH+CNF"]
-        fresh     = [h for h in hits if h.get("signal_status") == "🆕FRESH"]
-        confirm   = [h for h in hits if h.get("signal_status") == "✅CONFIRM"]
-        active    = [h for h in hits if h.get("signal_status") == "📊ACTIVE"]
-
-        rr_ok_cnt  = sum(1 for h in hits if h.get("rr_ok"))
-        sweep_cnt  = sum(1 for h in hits if h.get("liq_swept"))
-        choch_cnt  = sum(1 for h in hits if h.get("choch_ok"))
-        vol_cnt    = sum(1 for h in hits if h.get("vol_spike"))
-
-        # ── Row renderer ────────────────────────────────────────────────────
-        def _row(h: dict) -> str:
-            sym    = h["symbol"].replace("USDT", "")
-            ftype  = h.get("fvg_type", direction)
-            f_em   = "🔵" if "ifvg" in ftype else dir_em
-            f_lbl  = (f"iFVG-{'Bear' if is_sell else 'Bull'}"
-                      if "ifvg" in ftype
-                      else f"{'Bear' if is_sell else 'Bull'}FVG")
-            pos    = "✅trong" if h.get("inside") else "🔔gần"
-            ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
-            sc     = h.get(score_key, 0)
-            prev   = h.get("prev_score", 0)
-            status = h.get("signal_status", "📊ACTIVE")
-
-            # Dòng 1: symbol + status + giá
-            line1 = f"{h['tier']} *{sym}*  {status}  `{h['cur_price']:.4f}`\n"
-
-            # Dòng 2: FVG + score + freshness + confirmation
-            fresh_tag = f"  📈{prev}→{sc}" if h.get("signal_fresh") else ""
-            cnf_tag   = f"  {cnf_dir}"     if h.get("candle_confirms") else ""
-            line2 = (
-                f"  {f_em}{f_lbl} {pos}  {score_lbl}:`{sc}/11`"
-                f"{fresh_tag}{cnf_tag}\n"
-            )
-
-            # Dòng 3: FVG levels + khoảng cách
-            line3 = (
-                f"  FVG:`{h['fvg_bot']:.4f}`–`{h['fvg_top']:.4f}`"
-                f"  Mid{ab_mid}:`{h['dist_pct']:.2f}%`  _{h['age_bars']}nến_\n"
-            )
-
-            # Dòng 4: Sweep + CHoCH (nếu có)
-            extras = []
-            if h.get("liq_swept"):
-                extras.append(
-                    f"💧Sweep {h.get('liq_eq_type','')} "
-                    f"`{h.get('liq_level',0):.4f}` "
-                    f"({h.get('liq_bars_ago',0)}n trước)"
-                )
-            if h.get("choch_ok"):
-                extras.append(
-                    f"🔄CHoCH `{h.get('choch_level',0):.4f}` "
-                    f"({h.get('choch_bars_ago',0)}n trước)"
-                )
-            line4 = ("  " + "  ".join(extras) + "\n") if extras else ""
-
-            # Dòng 5: Volume + RR
-            vol_r   = h.get("vol_ratio", 1.0)
-            vol_tag = f"⚡Vol×{vol_r:.1f}" if h.get("vol_spike") else f"Vol×{vol_r:.1f}"
-            rr      = h.get("rr", 0.0)
-            rr_em   = "🟢" if h.get("rr_ok") else "🟡"
-            rr_tag  = f"{rr_em}RR:{rr:.1f}"
-            sl_p    = h.get("sl_price", 0.0)
-            tp_p    = h.get("tp_price", 0.0)
-            sl_pct  = h.get("sl_pct", 0.0)
-            tp_pct  = h.get("tp_pct", 0.0)
-            line5 = (
-                f"  {vol_tag}  {rr_tag}"
-                f"  🛑`{sl_p:.4f}`(-{sl_pct:.2f}%)"
-                f"  🎯`{tp_p:.4f}`(+{tp_pct:.2f}%)\n"
-            )
-
-            return line1 + line2 + line3 + line4 + line5
-
-        # ── Header ──────────────────────────────────────────────────────────
-        header = (
-            f"{dir_em} *{fvg_lbl} {fvg_tf.upper()} + {score_tf} {score_lbl}*"
-            f" — {len(hits)} token\n"
-            f"🎰 Sniper:{len(sniper)}  🎯 Fresh+Cnf:{len(fresh_cnf)}"
-            f"  🆕 Fresh:{len(fresh)}  ✅ Cnf:{len(confirm)}  📊 Active:{len(active)}\n"
-            f"💧 Sweep:{sweep_cnt}  🔄 CHoCH:{choch_cnt}"
-            f"  ⚡ VolSpike:{vol_cnt}  🟢 RR≥1.5:{rr_ok_cnt}\n"
-            f"_SL=ngoài FVG+0.2%  TP=swing liq gần nhất_\n"
-            f"{'─'*30}\n"
-        )
-
-        # ── Sections — theo status priority ──────────────────────────────────
-        STATUS_GROUPS = [
-            ("🎰SNIPER",    sniper,
-             "🎰 *SNIPER* — Sweep + CHoCH + Fresh + Confirm  ← VÀO LỆNH"),
-            ("🎯FRESH+CNF", fresh_cnf,
-             "🎯 *FRESH + XÁC NHẬN* — entry tốt"),
-            ("🆕FRESH",     fresh,
-             "🆕 *FRESH* — chờ nến xác nhận đóng cửa"),
-            ("✅CONFIRM",   confirm,
-             "✅ *CONFIRM* — nến ok, signal không mới"),
-            ("📊ACTIVE",    active,
-             "📊 *ACTIVE* — signal cũ, theo dõi"),
-        ]
-
-        sections = []
-        for _key, group, label in STATUS_GROUPS:
-            if not group:
-                continue
-            sections.append(f"{label} ({len(group)})\n")
-            for h in group:
-                sections.append(_row(h))
-            sections.append("\n")
-
-        # ── Gửi ─────────────────────────────────────────────────────────────
-        chunk = header
-        for line in sections:
-            if len(chunk) + len(line) > 3900:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = line
-            else:
-                chunk += line
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
-
-    # ── /ft family (Bear FVG + SELL) ─────────────────────────────────────
-
-    async def _ft(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/ft — Bear FVG 4h + 15m SELL ≥ 6  →  setup SHORT"""
-        await u.message.reply_text(
-            "🔴 Đang quét *Bear FVG 4h + 15m SELL* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_ft()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bear FVG 4h + SELL 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "sell", "4h", "15m")
-
-    async def _ft1h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/ft1h — Bear FVG 1h + 15m SELL ≥ 6  →  setup SHORT"""
-        await u.message.reply_text(
-            "🔴 Đang quét *Bear FVG 1h + 15m SELL* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_ft1h()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bear FVG 1h + SELL 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "sell", "1h", "15m")
-
-    async def _ft1d(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/ft1d — Bear FVG 1d + 1h SELL ≥ 6  →  setup SHORT"""
-        await u.message.reply_text(
-            "🔴 Đang quét *Bear FVG 1D + 1h SELL* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_ft1d()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bear FVG 1D + SELL 1h lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "sell", "1d", "1h")
-
-    # ── /fb family (Bull FVG + BUY) ──────────────────────────────────────
-
-    async def _fb(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/fb — Bull FVG 4h + 15m BUY ≥ 6  →  setup LONG"""
-        await u.message.reply_text(
-            "🟢 Đang quét *Bull FVG 4h + 15m BUY* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_fb()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bull FVG 4h + BUY 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "buy", "4h", "15m")
-
-    async def _fb1h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/fb1h — Bull FVG 1h + 15m BUY ≥ 6  →  setup LONG"""
-        await u.message.reply_text(
-            "🟢 Đang quét *Bull FVG 1h + 15m BUY* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_fb1h()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bull FVG 1h + BUY 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "buy", "1h", "15m")
-
-    async def _fb1d(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/fb1d — Bull FVG 1d + 1h BUY ≥ 6  →  setup LONG"""
-        await u.message.reply_text(
-            "🟢 Đang quét *Bull FVG 1D + 1h BUY* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_fb1d()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bull FVG 1D + BUY 1h lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "buy", "1d", "1h")
-
-    async def _fvgscan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+    async def scan_for_alert(self) -> list[SignalResult]:
         """
-        /fvgscan [tf]
-        Quét toàn bộ market (chỉ fetch TF được chỉ định, mặc định 4h).
-        Tìm tất cả token có giá hiện tại đang nằm TRONG vùng FVG.
-        Sort theo khoảng cách tới mid FVG (gần nhất trước).
+        Dùng cho auto alert (background 5 phút).
+        Áp cooldown 15 phút — token đã gửi gần đây bị skip.
+        Chỉ đánh dấu cooldown cho token thực sự được gửi đi.
         """
-        args    = c.args
-        tf      = args[0].lower() if args else "4h"
-        valid_tfs = {"5m", "15m", "30m", "1h", "4h", "1d"}
-        if tf not in valid_tfs:
-            await u.message.reply_text(
-                f"⚠️ Timeframe `{tf}` không hợp lệ.\nDùng: 5m | 15m | 30m | 1h | 4h | 1d"
-            )
-            return
+        all_signals = await self._run_scan()
 
-        await u.message.reply_text(
-            f"📐 Đang quét *toàn market* — FVG `{tf}` (~60–90s)...\n"
-            f"_Chỉ lấy token giá đang NẰM TRONG vùng FVG_",
-            parse_mode="Markdown"
+        to_send = []
+        for r in all_signals:
+            if not self._in_cooldown(r.symbol):
+                self._mark_alert(r.symbol)
+                to_send.append(r)
+
+        skipped = len(all_signals) - len(to_send)
+        logger.info(
+            f"auto alert → gửi {len(to_send)} / skip {skipped} (cooldown) "
+            f"/ tổng {len(all_signals)}"
         )
+        return to_send
 
-        hits = await self.scanner.scan_fvg(tf=tf)
-
-        if not hits:
-            await u.message.reply_text(
-                f"❌ Không có token nào đang nằm trong FVG {tf} lúc này."
-            )
-            return
-
-        # Phân loại
-        bull_hits  = [h for h in hits if h["fvg_type"] == "bull"]
-        bear_hits  = [h for h in hits if h["fvg_type"] == "bear"]
-        ifvg_hits  = [h for h in hits if h["fvg_type"] not in ("bull", "bear")]
-
-        def _row(h: dict) -> str:
-            t     = h["fvg_type"]
-            emoji = "🟢" if t == "bull" else ("🔴" if t == "bear" else "🔵")
-            side  = "Bull" if t == "bull" else ("Bear" if t == "bear" else "iFVG")
-            sym   = h["symbol"].replace("USDT", "")
-            above_mid = "↑mid" if h["cur_price"] >= h["fvg_mid"] else "↓mid"
-            return (
-                f"{emoji} *{sym}*  `{h['cur_price']:.4f}`  [{side}]\n"
-                f"  Vùng: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`"
-                f"  Gap:`{h['gap_pct']:.2f}%`  Cách mid:`{h['dist_pct']:.2f}%`{above_mid}"
-                f"  _{h['age_bars']}nến_\n"
-            )
-
-        header = (
-            f"📐 *FVG Scan {tf.upper()}* — {len(hits)} token trong FVG\n"
-            f"🟢 Bull: {len(bull_hits)}  🔴 Bear: {len(bear_hits)}  🔵 iFVG: {len(ifvg_hits)}\n"
-            f"{'─'*30}\n"
-        )
-
-        # Build các section, gửi theo chunk ≤ 4000 ký tự
-        sections = []
-        if bull_hits:
-            sections.append(f"🟢 *Bullish FVG* ({len(bull_hits)} token)\n")
-            for h in bull_hits:
-                sections.append(_row(h))
-        if bear_hits:
-            sections.append(f"\n🔴 *Bearish FVG* ({len(bear_hits)} token)\n")
-            for h in bear_hits:
-                sections.append(_row(h))
-        if ifvg_hits:
-            sections.append(f"\n🔵 *iFVG* ({len(ifvg_hits)} token)\n")
-            for h in ifvg_hits:
-                sections.append(_row(h))
-
-        # Gom thành các chunk
-        chunk = header
-        for line in sections:
-            if len(chunk) + len(line) > 3900:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = line
-            else:
-                chunk += line
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
-
-    async def _fvg(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /fvg BTC [tf]
-        tf mặc định: 15m. Hỗ trợ: 5m 15m 30m 1h 4h 1d
-        Hiển thị Bullish FVG, Bearish FVG, iFVG còn hiệu lực gần giá nhất.
-        Logic port đúng từ Pine Script Section T3.
-        """
-        args = c.args
-        if not args:
-            await u.message.reply_text(
-                "⚠️ Dùng: /fvg BTC hoặc /fvg BTCUSDT 1h\n"
-                "Timeframe hỗ trợ: 5m 15m 30m 1h 4h 1d"
-            )
-            return
-
-        sym = args[0].upper()
+    async def scan_symbol(self, symbol: str) -> Optional[SignalResult]:
+        """Quét 1 token (/check), bỏ ngưỡng ultra, luôn trả kết quả."""
+        sym = symbol.upper()
         if not sym.endswith("USDT"):
             sym += "USDT"
+        return await self._analyse_one(sym, ignore_threshold=True)
 
-        tf_input = args[1].lower() if len(args) > 1 else "15m"
-        valid_tfs = {"5m", "15m", "30m", "1h", "4h", "1d"}
-        if tf_input not in valid_tfs:
-            await u.message.reply_text(
-                f"⚠️ Timeframe `{tf_input}` không hợp lệ.\n"
-                f"Dùng: 5m | 15m | 30m | 1h | 4h | 1d"
-            )
-            return
+    async def scan_fvg(self, tf: str = "4h", limit: int = 100) -> list[dict]:
+        """
+        Quét toàn bộ market, tìm token có giá đang NẰM TRONG FVG của timeframe `tf`.
+        Chỉ fetch 1 TF duy nhất → nhanh hơn nhiều so với full scan 6TF.
 
-        await u.message.reply_text(
-            f"📐 Đang tính FVG cho *{sym}* ({tf_input})...",
-            parse_mode="Markdown"
+        Trả list[dict]:
+          symbol, cur_price, fvg_type ("bull"|"bear"|"ifvg_bull"|"ifvg_bear"),
+          fvg_top, fvg_bot, fvg_mid, gap_pct, dist_pct, age_bars
+        Sort: dist_pct tăng dần (gần mid FVG nhất trước).
+        """
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(f"FVG scan: {len(symbols)} symbols, tf={tf}")
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def _check_one(sym: str) -> list[dict]:
+            async with sem:
+                try:
+                    df = await self.fetcher.fetch_ohlcv(sym, tf, limit=limit)
+                    if df is None or len(df) < 3:
+                        return []
+
+                    res = detect_fvg(df, min_gap_pct=0.0, max_keep=10)
+                    cur = res["cur_price"]
+                    if cur <= 0:
+                        return []
+
+                    hits = []
+
+                    def _check_fvg_list(fvgs: list, fvg_type: str):
+                        for fvg in fvgs:
+                            top = fvg["top"]
+                            bot = fvg["bottom"]
+                            # Giá đang NẰM TRONG vùng FVG
+                            if bot <= cur <= top:
+                                mid      = (top + bot) / 2
+                                dist_pct = abs(cur - mid) / mid * 100 if mid > 0 else 0
+                                hits.append({
+                                    "symbol":    sym,
+                                    "cur_price": cur,
+                                    "fvg_type":  fvg_type,
+                                    "fvg_top":   top,
+                                    "fvg_bot":   bot,
+                                    "fvg_mid":   round(mid, 6),
+                                    "gap_pct":   fvg["gap_pct"],
+                                    "dist_pct":  round(dist_pct, 2),
+                                    "age_bars":  fvg["age_bars"],
+                                })
+
+                    _check_fvg_list(res["bull_fvgs"], "bull")
+                    _check_fvg_list(res["bear_fvgs"], "bear")
+                    for ifvg in res["ifvgs"]:
+                        _check_fvg_list([ifvg], ifvg.get("status", "ifvg"))
+
+                    return hits
+                except Exception as e:
+                    logger.debug(f"scan_fvg {sym}: {e}")
+                    return []
+
+        all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
+
+        hits = [item for sublist in all_lists for item in sublist]
+        # Sort: gần mid FVG nhất trước
+        hits.sort(key=lambda x: x["dist_pct"])
+        logger.info(f"FVG scan done: {len(hits)} tokens in FVG ({tf})")
+        return hits
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CORE ENGINE — Bear/Bull FVG scan với bất kỳ TF nào
+    # ──────────────────────────────────────────────────────────────────────
+
+    # Buffer scale theo TF — FVG 1D rộng hơn nhiều so với 1h
+    _FVG_BUFFER = {"1h": 0.003, "4h": 0.005, "1d": 0.010}
+
+    # Mapping score_tf → kwargs đúng cho score_symbol
+    @staticmethod
+    def _score_kwargs(score_tf: str, df_score, fvg_tf: str, df_fvg) -> dict:
+        """
+        Build kwargs cho score_symbol:
+          - df_5m + df_15m luôn được set = df_score (base bắt buộc)
+          - slot đúng với score_tf cũng được set = df_score
+          - slot đúng với fvg_tf được set = df_fvg (nếu khác score_tf)
+          - các slot còn lại = None
+
+        Lý do set cả df_5m/df_15m: score_symbol dùng chúng làm
+        base tính toán; nếu None thì ultra_score trả 0 dù có df_1h.
+        """
+        TF_SLOT = {
+            "5m": "df_5m", "15m": "df_15m", "30m": "df_30m",
+            "1h": "df_1h", "4h":  "df_4h",  "1d":  "df_1d",
+        }
+        kwargs = dict(df_5m=None, df_15m=None, df_30m=None,
+                      df_1h=None, df_4h=None,  df_1d=None)
+
+        # Base bắt buộc — score_symbol cần ít nhất df_5m hoặc df_15m
+        kwargs["df_5m"]  = df_score
+        kwargs["df_15m"] = df_score
+
+        # Override đúng slot score_tf
+        slot_score = TF_SLOT.get(score_tf)
+        if slot_score:
+            kwargs[slot_score] = df_score
+
+        # Điền df_fvg vào đúng slot fvg_tf (tránh ghi đè slot score)
+        slot_fvg = TF_SLOT.get(fvg_tf)
+        if slot_fvg and slot_fvg != slot_score:
+            kwargs[slot_fvg] = df_fvg
+
+        return kwargs
+
+    async def _scan_bear_fvg(self, fvg_tf: str, score_tf: str) -> list[dict]:
+        """
+        Core engine cho /ft, /ft1h, /ft1d — setup SHORT.
+
+        Logic SMC đúng:
+          • Bear FVG   : vùng kháng cự gốc (giá rớt mạnh tạo ra)
+          • iFVG bull  : Bull FVG đã bị giá phá xuống → đổi vai trò thành kháng cự
+
+        Fix so với phiên bản cũ:
+          [1] iFVG đúng vai trò  → lấy ifvg_bull thay vì ifvg_bear
+          [2] df_4h pass đúng TF → dùng _score_kwargs()
+          [3] Buffer scale theo TF → _FVG_BUFFER[fvg_tf]
+        """
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(
+            f"FT scan: {len(symbols)} symbols "
+            f"(Bear FVG-{fvg_tf} + {score_tf} SELL≥6)"
         )
+        BUFFER = self._FVG_BUFFER.get(fvg_tf, 0.005)   # [Fix 3]
+        sem    = asyncio.Semaphore(CONCURRENCY)
 
-        df = await self.scanner.fetcher.fetch_ohlcv(sym, tf_input, limit=100)
-        if df is None or len(df) < 3:
-            await u.message.reply_text(
-                f"❌ Không lấy được dữ liệu {sym} ({tf_input}).\n"
-                f"Dùng /debug để kiểm tra kết nối."
-            )
-            return
+        async def _check_one(sym: str) -> list[dict]:
+            async with sem:
+                try:
+                    df_fvg, df_score = await asyncio.gather(
+                        self.fetcher.fetch_ohlcv(sym, fvg_tf,   100),
+                        self.fetcher.fetch_ohlcv(sym, score_tf, 100),
+                    )
+                    if df_fvg is None or len(df_fvg) < 3:
+                        return []
+                    if df_score is None or len(df_score) < 50:
+                        return []
 
-        result = detect_fvg(df, min_gap_pct=0.0, max_keep=5)
-        cur    = result["cur_price"]
-        bulls  = result["bull_fvgs"]
-        bears  = result["bear_fvgs"]
-        ifvgs  = result["ifvgs"]
+                    # ── Bước 1: Chọn đúng FVG kháng cự ───────────────────
+                    fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
+                    cur     = fvg_res["cur_price"]
+                    if cur <= 0:
+                        return []
 
-        def _fmt_fvg(fvg: dict, label: str, emoji: str) -> str:
-            top    = fvg["top"]
-            bot    = fvg["bottom"]
-            mid    = (top + bot) / 2
-            gap    = fvg["gap_pct"]
-            age    = fvg["age_bars"]
-            dist   = abs(mid - cur) / cur * 100 if cur > 0 else 0
-            above  = "⬆️ phía TRÊN" if mid > cur else "⬇️ phía DƯỚI"
-            status = fvg.get("status", "active")
-            status_tag = ""
-            if status == "ifvg_bull":
-                status_tag = " _(iFVG — đã phá lên)_"
-            elif status == "ifvg_bear":
-                status_tag = " _(iFVG — đã phá xuống)_"
-            return (
-                f"{emoji} *{label}*{status_tag}\n"
-                f"  Top: `{top:.4f}` | Bot: `{bot:.4f}` | Mid: `{mid:.4f}`\n"
-                f"  Gap: `{gap:.3f}%` | Cách giá: `{dist:.2f}%` {above}\n"
-                f"  ⏳ {age} nến trước\n"
-            )
+                    # [Fix 1] Bear FVG gốc  +  iFVG bull (bull FVG bị phá xuống
+                    #         → giờ đóng vai kháng cự)
+                    bear_fvgs = fvg_res["bear_fvgs"]
+                    ifvg_bull_as_res = [f for f in fvg_res["ifvgs"]
+                                        if f.get("status", "") == "ifvg_bull"]
+                    candidates = [(f, "bear")      for f in bear_fvgs] + \
+                                 [(f, "ifvg_bull") for f in ifvg_bull_as_res]
 
-        lines = [
-            f"📐 *FVG — {sym}* `({tf_input})`\n"
-            f"💰 Giá hiện tại: `{cur:.4f}`\n"
-            f"{'─' * 30}\n"
-        ]
+                    fvg_hits = []
+                    for fvg, ftype in candidates:
+                        top_buf = fvg["top"]    * (1 + BUFFER)   # [Fix 3]
+                        bot_buf = fvg["bottom"] * (1 - BUFFER)
+                        if bot_buf <= cur <= top_buf:
+                            mid      = (fvg["top"] + fvg["bottom"]) / 2
+                            dist_pct = abs(cur - mid) / mid * 100 if mid > 0 else 0
+                            inside   = fvg["bottom"] <= cur <= fvg["top"]
+                            fvg_hits.append({**fvg, "dist_pct": round(dist_pct, 2),
+                                             "inside": inside, "fvg_type": ftype})
+                    if not fvg_hits:
+                        return []
 
-        if bulls:
-            lines.append(f"🟢 *Bullish FVG* ({len(bulls)} vùng)\n")
-            for i, fvg in enumerate(bulls, 1):
-                lines.append(_fmt_fvg(fvg, f"Bull FVG #{i}", "🟩"))
-        else:
-            lines.append("🟢 *Bullish FVG*: Không có vùng hiệu lực\n")
+                    # ── Bước 2: SELL score hiện tại ───────────────────────
+                    kwargs     = self._score_kwargs(score_tf, df_score,
+                                                   fvg_tf,   df_fvg)
+                    result     = score_symbol(sym, **kwargs)
+                    sell_score = result.ultra_sell_score
+                    if sell_score < 6:
+                        return []
 
-        lines.append(f"{'─' * 30}\n")
+                    # ── Bước 3: Signal freshness — score 3 nến trước ──────
+                    # So sánh score hiện tại vs 3 nến trước để phát hiện
+                    # signal vừa xuất hiện (tỉ lệ thắng cao hơn signal cũ)
+                    FRESH_LOOKBACK = 3
+                    prev_score = 0
+                    if len(df_score) > FRESH_LOOKBACK + 50:
+                        df_prev   = df_score.iloc[:-FRESH_LOOKBACK]
+                        kw_prev   = self._score_kwargs(score_tf, df_prev,
+                                                       fvg_tf,   df_fvg)
+                        prev_res  = score_symbol(sym, **kw_prev)
+                        prev_score = prev_res.ultra_sell_score
 
-        if bears:
-            lines.append(f"🔴 *Bearish FVG* ({len(bears)} vùng)\n")
-            for i, fvg in enumerate(bears, 1):
-                lines.append(_fmt_fvg(fvg, f"Bear FVG #{i}", "🟥"))
-        else:
-            lines.append("🔴 *Bearish FVG*: Không có vùng hiệu lực\n")
+                    # Fresh = score vừa bật lên (3 nến trước chưa đạt ngưỡng)
+                    signal_fresh = prev_score < 6
 
-        lines.append(f"{'─' * 30}\n")
+                    # ── Bước 4: Nến xác nhận — nến 15m cuối bearish ───────
+                    last_c = df_score.iloc[-1]
+                    candle_confirms = float(last_c["close"]) < float(last_c["open"])
 
-        if ifvgs:
-            lines.append(f"🔵 *iFVG* ({len(ifvgs)} vùng — đã bị phá nhưng chưa hoàn toàn)\n")
-            for i, fvg in enumerate(ifvgs, 1):
-                dir_lbl = "Bull iFVG" if fvg.get("status") == "ifvg_bull" else "Bear iFVG"
-                lines.append(_fmt_fvg(fvg, f"{dir_lbl} #{i}", "🔷"))
-        else:
-            lines.append("🔵 *iFVG*: Không có\n")
+                    # ── Chọn FVG kháng cự gần giá nhất ───────────────────
+                    fvg_hits.sort(key=lambda x: x["dist_pct"])
+                    best = fvg_hits[0]
+                    mid  = (best["top"] + best["bottom"]) / 2
+                    tier = "🔥" if sell_score >= 9 and best["inside"] else (
+                           "⚡" if sell_score >= 8 else "📌")
 
-        lines.append(
-            f"{'─' * 30}\n"
-            f"_📌 Dùng /fvg {sym[:-4]} 1h hoặc /fvg {sym[:-4]} 4h để xem TF khác_"
+                    # ── Bước 5: Liquidity Sweep ────────────────────────────
+                    sweep_res  = detect_liquidity_sweep(df_score)
+                    liq_swept  = sweep_res["swept"]
+                    # Chỉ tính high sweep (quét liq trên → SHORT hợp lý hơn)
+                    liq_valid  = liq_swept and sweep_res["sweep_type"] == "high"
+
+                    # ── Bước 6: CHoCH ──────────────────────────────────────
+                    choch_res  = detect_choch(df_score)
+                    choch_ok   = (choch_res["choch_detected"]
+                                  and choch_res["choch_type"] == "bear")
+
+                    # ── Bước 7: Volume spike tại FVG ───────────────────────
+                    vol_res    = detect_vol_spike_at_fvg(
+                        df_score, best["top"], best["bottom"])
+                    vol_spike  = vol_res["vol_spike"]
+
+                    # ── Bước 8: RR tự động ─────────────────────────────────
+                    rr_res     = calc_fvg_rr(
+                        df_score, cur, best["top"], best["bottom"], "sell")
+                    rr_ok      = rr_res["rr_ok"]
+
+                    # ── Signal status (SNIPER tier mới) ────────────────────
+                    # SNIPER: Sweep + CHoCH + Fresh + Confirm → entry chất lượng nhất
+                    if liq_valid and choch_ok and signal_fresh and candle_confirms:
+                        signal_status = "🎰SNIPER"
+                    elif signal_fresh and candle_confirms:
+                        signal_status = "🎯FRESH+CNF"   # Tốt nhất: mới + xác nhận
+                    elif signal_fresh:
+                        signal_status = "🆕FRESH"        # Signal mới nhưng nến chưa đóng bearish
+                    elif candle_confirms:
+                        signal_status = "✅CONFIRM"      # Nến xác nhận nhưng signal không mới
+                    else:
+                        signal_status = "📊ACTIVE"       # Signal cũ, chưa có nến xác nhận
+
+                    return [{
+                        "symbol":          sym,
+                        "cur_price":       cur,
+                        "fvg_type":        best.get("fvg_type", "bear"),
+                        "fvg_top":         best["top"],
+                        "fvg_bot":         best["bottom"],
+                        "fvg_mid":         round(mid, 6),
+                        "gap_pct":         best["gap_pct"],
+                        "dist_pct":        best["dist_pct"],
+                        "inside":          best["inside"],
+                        "age_bars":        best["age_bars"],
+                        "sell_score":      sell_score,
+                        "prev_score":      prev_score,
+                        "signal_fresh":    signal_fresh,
+                        "candle_confirms": candle_confirms,
+                        "signal_status":   signal_status,
+                        "tier":            tier,
+                        # Bước 5 — Liquidity Sweep
+                        "liq_swept":       liq_valid,
+                        "liq_eq_type":     sweep_res.get("eq_type", ""),
+                        "liq_level":       sweep_res.get("sweep_level", 0.0),
+                        "liq_bars_ago":    sweep_res.get("bars_ago", 0),
+                        # Bước 6 — CHoCH
+                        "choch_ok":        choch_ok,
+                        "choch_level":     choch_res.get("choch_level", 0.0),
+                        "choch_bars_ago":  choch_res.get("bars_ago", 0),
+                        # Bước 7 — Volume
+                        "vol_spike":       vol_spike,
+                        "vol_ratio":       vol_res.get("vol_ratio", 1.0),
+                        # Bước 8 — RR
+                        "rr":              rr_res.get("rr", 0.0),
+                        "rr_ok":           rr_ok,
+                        "sl_price":        rr_res.get("sl_price", 0.0),
+                        "tp_price":        rr_res.get("tp_price", 0.0),
+                        "sl_pct":          rr_res.get("sl_pct", 0.0),
+                        "tp_pct":          rr_res.get("tp_pct", 0.0),
+                    }]
+                except Exception as e:
+                    logger.debug(f"scan_bear_fvg {sym}: {e}")
+                    return []
+
+        all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
+        hits = [item for sublist in all_lists for item in sublist]
+        # Sort: FRESH+CNF > FRESH > CONFIRM > ACTIVE, rồi score cao, rồi gần FVG
+        STATUS_RANK = {"🎰SNIPER": 0, "🎯FRESH+CNF": 1, "🆕FRESH": 2, "✅CONFIRM": 3, "📊ACTIVE": 4}
+        hits.sort(key=lambda x: (
+            STATUS_RANK.get(x["signal_status"], 9),
+            -x["sell_score"],
+            x["dist_pct"],
+        ))
+        fresh_cnt = sum(1 for h in hits if h["signal_fresh"])
+        cnf_cnt   = sum(1 for h in hits if h["candle_confirms"])
+        logger.info(
+            f"FT ({fvg_tf}) done: {len(hits)} tokens "
+            f"(fresh:{fresh_cnt} confirm:{cnf_cnt}) "
+            f"(Bear FVG + {score_tf} SELL≥6)"
         )
+        return hits
 
-        msg = "".join(lines)
-        # Chia nhỏ nếu quá dài
-        if len(msg) > 4096:
-            chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
-            for chunk in chunks:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-        else:
-            await u.message.reply_text(msg, parse_mode="Markdown")
+    async def _scan_bull_fvg(self, fvg_tf: str, score_tf: str) -> list[dict]:
+        """
+        Core engine cho /fb, /fb1h, /fb1d — setup LONG.
 
-    async def _check(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        args = c.args
-        if not args:
-            await u.message.reply_text("⚠️ Dùng: /check BTC hoặc /check BTCUSDT")
-            return
-        sym = args[0].upper()
-        if not sym.endswith("USDT"):
-            sym += "USDT"
-        await u.message.reply_text(f"🔍 Đang phân tích {sym} (6 TF)...")
-        r = await self.scanner.scan_symbol(sym)
-        if r is None:
-            await u.message.reply_text(
-                f"❌ Không lấy được data cho {sym}.\nDùng /debug kiểm tra kết nối."
-            )
-            return
-        await u.message.reply_text(_fmt(r), parse_mode="Markdown")
+        Logic SMC đúng:
+          • Bull FVG   : vùng hỗ trợ gốc (giá tăng mạnh tạo ra)
+          • iFVG bear  : Bear FVG đã bị giá phá lên → đổi vai trò thành hỗ trợ
 
-    async def _source(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        import fetcher as f_module
-        base = getattr(f_module, "BASE", "unknown")
-        await u.message.reply_text(
-            f"📡 *API Source*\n"
-            f"Base URL: `{base}`\n"
-            f"Class: `{self.scanner.fetcher.__class__.__name__}`",
-            parse_mode="Markdown"
+        Fix so với phiên bản cũ:
+          [1] iFVG đúng vai trò  → lấy ifvg_bear thay vì ifvg_bull
+          [2] df_4h pass đúng TF → dùng _score_kwargs()
+          [3] Buffer scale theo TF → _FVG_BUFFER[fvg_tf]
+        """
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(
+            f"FB scan: {len(symbols)} symbols "
+            f"(Bull FVG-{fvg_tf} + {score_tf} BUY≥6)"
         )
+        BUFFER = self._FVG_BUFFER.get(fvg_tf, 0.005)   # [Fix 3]
+        sem    = asyncio.Semaphore(CONCURRENCY)
 
-    async def _debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text("🔧 Đang debug...")
-        import aiohttp
-        import fetcher as f_module
-        base    = getattr(f_module, "BASE", "https://www.okx.com")
-        fetcher = self.scanner.fetcher
-        lines   = [f"📡 API: `{base}`"]
+        async def _check_one(sym: str) -> list[dict]:
+            async with sem:
+                try:
+                    df_fvg, df_score = await asyncio.gather(
+                        self.fetcher.fetch_ohlcv(sym, fvg_tf,   100),
+                        self.fetcher.fetch_ohlcv(sym, score_tf, 100),
+                    )
+                    if df_fvg is None or len(df_fvg) < 3:
+                        return []
+                    if df_score is None or len(df_score) < 50:
+                        return []
 
-        try:
-            session = await fetcher._get_session()
-            async with session.get(
-                f"{base}/api/v5/public/time",
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                body = await resp.json()
-                lines.append(f"🌐 Ping: HTTP {resp.status} — {body.get('code','?')}")
-        except Exception as e:
-            lines.append(f"🌐 Ping FAILED: {type(e).__name__}: {e}")
+                    # ── Bước 1: Chọn đúng FVG hỗ trợ ─────────────────────
+                    fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
+                    cur     = fvg_res["cur_price"]
+                    if cur <= 0:
+                        return []
 
-        for sym in ["BTCUSDT", "ETHUSDT"]:
-            try:
-                df5  = await fetcher.fetch_ohlcv(sym, "5m",  10)
-                df15 = await fetcher.fetch_ohlcv(sym, "15m", 10)
-                df1d = await fetcher.fetch_ohlcv(sym, "1d",  10)
-                ok5  = f"{len(df5)} bars"  if df5  is not None else "FAIL"
-                ok15 = f"{len(df15)} bars" if df15 is not None else "FAIL"
-                ok1d = f"{len(df1d)} bars" if df1d is not None else "FAIL"
-                close = df5["close"].iloc[-1] if df5 is not None else "?"
-                lines.append(f"✅ {sym}: 5m={ok5} 15m={ok15} 1d={ok1d} | close={close}")
-            except Exception as e:
-                lines.append(f"❌ {sym}: {type(e).__name__}: {str(e)[:80]}")
+                    # [Fix 1] Bull FVG gốc  +  iFVG bear (bear FVG bị phá lên
+                    #         → giờ đóng vai hỗ trợ)
+                    bull_fvgs = fvg_res["bull_fvgs"]
+                    ifvg_bear_as_sup = [f for f in fvg_res["ifvgs"]
+                                        if f.get("status", "") == "ifvg_bear"]
+                    candidates = [(f, "bull")      for f in bull_fvgs] + \
+                                 [(f, "ifvg_bear") for f in ifvg_bear_as_sup]
 
-        syms = await fetcher.fetch_top_symbols(10)
-        lines.append(f"\n📋 Symbols ({len(syms)} total): {syms[:5]}")
-        lines.append(f"🎯 Min score: {self.scanner.min_score}")
-        await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+                    fvg_hits = []
+                    for fvg, ftype in candidates:
+                        top_buf = fvg["top"]    * (1 + BUFFER)   # [Fix 3]
+                        bot_buf = fvg["bottom"] * (1 - BUFFER)
+                        if bot_buf <= cur <= top_buf:
+                            mid      = (fvg["top"] + fvg["bottom"]) / 2
+                            dist_pct = abs(cur - mid) / mid * 100 if mid > 0 else 0
+                            inside   = fvg["bottom"] <= cur <= fvg["top"]
+                            fvg_hits.append({**fvg, "dist_pct": round(dist_pct, 2),
+                                             "inside": inside, "fvg_type": ftype})
+                    if not fvg_hits:
+                        return []
 
-    async def _status(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text(
-            f"✅ *Bot v3.0 Running*\n"
-            f"📊 Cooldown tokens: {len(self.scanner._last_alert)}\n"
-            f"🎯 Min score: {self.scanner.min_score}\n"
-            f"🔢 Max tokens/scan: {self.scanner.max_symbols}\n\n"
-            f"🔧 *Engine*\n"
-            f"• SXL Sniper (5 confluences, 0–10pt)\n"
-            f"• ST AI + UT Bot + SAR + SMC\n"
-            f"• RSI MTF 6 TF\n"
-            f"• MTF 3 tầng (5m/30m/1h+4h+1d)\n"
-            f"• ULTRA Score 0–11\n"
-            f"• Zone Classifier\n"
-            f"• Spike Detector + Leverage Advisor\n\n"
-            f"Dùng /debug để test kết nối API",
-            parse_mode="Markdown"
+                    # ── Bước 2: BUY score hiện tại ────────────────────────
+                    kwargs    = self._score_kwargs(score_tf, df_score,
+                                                  fvg_tf,   df_fvg)
+                    result    = score_symbol(sym, **kwargs)
+                    buy_score = result.ultra_buy_score
+                    if buy_score < 6:
+                        return []
+
+                    # ── Bước 3: Signal freshness — score 3 nến trước ──────
+                    FRESH_LOOKBACK = 3
+                    prev_score = 0
+                    if len(df_score) > FRESH_LOOKBACK + 50:
+                        df_prev   = df_score.iloc[:-FRESH_LOOKBACK]
+                        kw_prev   = self._score_kwargs(score_tf, df_prev,
+                                                       fvg_tf,   df_fvg)
+                        prev_res  = score_symbol(sym, **kw_prev)
+                        prev_score = prev_res.ultra_buy_score
+
+                    signal_fresh = prev_score < 6
+
+                    # ── Bước 4: Nến xác nhận — nến cuối bullish ───────────
+                    last_c = df_score.iloc[-1]
+                    candle_confirms = float(last_c["close"]) > float(last_c["open"])
+
+                    # ── Chọn FVG hỗ trợ gần giá nhất ─────────────────────
+                    fvg_hits.sort(key=lambda x: x["dist_pct"])
+                    best = fvg_hits[0]
+                    mid  = (best["top"] + best["bottom"]) / 2
+                    tier = "🔥" if buy_score >= 9 and best["inside"] else (
+                           "⚡" if buy_score >= 8 else "📌")
+
+                    # ── Bước 5: Liquidity Sweep ────────────────────────────
+                    sweep_res = detect_liquidity_sweep(df_score)
+                    liq_swept = sweep_res["swept"]
+                    # Low sweep → giá quét liq dưới trước khi tăng (hợp lý cho LONG)
+                    liq_valid = liq_swept and sweep_res["sweep_type"] == "low"
+
+                    # ── Bước 6: CHoCH ──────────────────────────────────────
+                    choch_res = detect_choch(df_score)
+                    choch_ok  = (choch_res["choch_detected"]
+                                 and choch_res["choch_type"] == "bull")
+
+                    # ── Bước 7: Volume spike tại FVG ───────────────────────
+                    vol_res   = detect_vol_spike_at_fvg(
+                        df_score, best["top"], best["bottom"])
+                    vol_spike = vol_res["vol_spike"]
+
+                    # ── Bước 8: RR tự động ─────────────────────────────────
+                    rr_res    = calc_fvg_rr(
+                        df_score, cur, best["top"], best["bottom"], "buy")
+                    rr_ok     = rr_res["rr_ok"]
+
+                    # ── Signal status ───────────────────────────────────────
+                    if liq_valid and choch_ok and signal_fresh and candle_confirms:
+                        signal_status = "🎰SNIPER"
+                    elif signal_fresh and candle_confirms:
+                        signal_status = "🎯FRESH+CNF"
+                    elif signal_fresh:
+                        signal_status = "🆕FRESH"
+                    elif candle_confirms:
+                        signal_status = "✅CONFIRM"
+                    else:
+                        signal_status = "📊ACTIVE"
+
+                    return [{
+                        "symbol":          sym,
+                        "cur_price":       cur,
+                        "fvg_type":        best.get("fvg_type", "bull"),
+                        "fvg_top":         best["top"],
+                        "fvg_bot":         best["bottom"],
+                        "fvg_mid":         round(mid, 6),
+                        "gap_pct":         best["gap_pct"],
+                        "dist_pct":        best["dist_pct"],
+                        "inside":          best["inside"],
+                        "age_bars":        best["age_bars"],
+                        "buy_score":       buy_score,
+                        "prev_score":      prev_score,
+                        "signal_fresh":    signal_fresh,
+                        "candle_confirms": candle_confirms,
+                        "signal_status":   signal_status,
+                        "tier":            tier,
+                        # Bước 5 — Liquidity Sweep
+                        "liq_swept":       liq_valid,
+                        "liq_eq_type":     sweep_res.get("eq_type", ""),
+                        "liq_level":       sweep_res.get("sweep_level", 0.0),
+                        "liq_bars_ago":    sweep_res.get("bars_ago", 0),
+                        # Bước 6 — CHoCH
+                        "choch_ok":        choch_ok,
+                        "choch_level":     choch_res.get("choch_level", 0.0),
+                        "choch_bars_ago":  choch_res.get("bars_ago", 0),
+                        # Bước 7 — Volume
+                        "vol_spike":       vol_spike,
+                        "vol_ratio":       vol_res.get("vol_ratio", 1.0),
+                        # Bước 8 — RR
+                        "rr":              rr_res.get("rr", 0.0),
+                        "rr_ok":           rr_ok,
+                        "sl_price":        rr_res.get("sl_price", 0.0),
+                        "tp_price":        rr_res.get("tp_price", 0.0),
+                        "sl_pct":          rr_res.get("sl_pct", 0.0),
+                        "tp_pct":          rr_res.get("tp_pct", 0.0),
+                    }]
+                except Exception as e:
+                    logger.debug(f"scan_bull_fvg {sym}: {e}")
+                    return []
+
+        all_lists = await asyncio.gather(*[_check_one(s) for s in symbols])
+        hits = [item for sublist in all_lists for item in sublist]
+        STATUS_RANK = {"🎰SNIPER": 0, "🎯FRESH+CNF": 1, "🆕FRESH": 2, "✅CONFIRM": 3, "📊ACTIVE": 4}
+        hits.sort(key=lambda x: (
+            STATUS_RANK.get(x["signal_status"], 9),
+            -x["buy_score"],
+            x["dist_pct"],
+        ))
+        fresh_cnt = sum(1 for h in hits if h["signal_fresh"])
+        cnf_cnt   = sum(1 for h in hits if h["candle_confirms"])
+        logger.info(
+            f"FB ({fvg_tf}) done: {len(hits)} tokens "
+            f"(fresh:{fresh_cnt} confirm:{cnf_cnt}) "
+            f"(Bull FVG + {score_tf} BUY≥6)"
         )
+        return hits
 
-    async def send_signal(self, chat_id: str, result: SignalResult):
-        """Gửi auto alert — ưu tiên ULTRA verdict."""
-        try:
-            ultra_max = max(result.ultra_buy_score, result.ultra_sell_score,
-                        result.ultra_1h_buy,    result.ultra_1h_sell,
-                        result.ultra_4h_buy,    result.ultra_4h_sell,
-                        result.ultra_1d_buy,    result.ultra_1d_sell)
-            if ultra_max >= 9:
-                prefix = "🚨🚀 *AUTO ALERT — STRONG*"
-            elif ultra_max >= 7:
-                prefix = "🚨✅ *AUTO ALERT*"
-            else:
-                prefix = "🚨 *AUTO ALERT*"
-            if result.is_premium:
-                prefix += " ⭐ PREMIUM"
-            await self.app.bot.send_message(
-                chat_id=chat_id,
-                text=f"{prefix}\n\n{_fmt(result)}",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.error(f"send_signal {chat_id}: {e}")
+    # ──────────────────────────────────────────────────────────────────────
+    # /top — COMPOSITE SCAN: gộp mọi điều kiện, sort theo lợi nhuận tiềm năng
+    # ──────────────────────────────────────────────────────────────────────
 
-    def run_polling(self):
-        self.app.run_polling(drop_pending_updates=True)
+    async def scan_top_composite(self) -> list[dict]:
+        """
+        Quét TOÀN thị trường, gộp TẤT CẢ điều kiện từ mọi lệnh:
+          • ULTRA Score (15m / 1h / 4h / 1d)         — từ scan_all / /scan
+          • Bull FVG  (4h + 1h + 1d) × BUY  score    — từ /fb /fb1h /fb1d
+          • Bear FVG  (4h + 1h + 1d) × SELL score    — từ /ft /ft1h /ft1d
+          • Liquidity Sweep + CHoCH + Vol Spike + RR  — từ engine FVG
+          • SXL score / vol_confirm / is_premium       — từ SignalResult
+
+        Composite score (0–100) tính như sau:
+          [A] ULTRA_MAX   = max score bất kỳ TF         → 0–11  (×4 = 0–44)
+          [B] FVG tier    = SNIPER=5 FRESH+CNF=4 FRESH=3 CONFIRM=2 ACTIVE=1 NO=0  (×3 = 0–15)
+          [C] Confluence  = Sweep+CHoCH+VolSpike+RR_ok  → 0–4   (×3 = 0–12)
+          [D] SXL score   = 0–10                         → 0–10  (×1 = 0–10)
+          [E] Bonus       = is_premium+2 / vol_confirm+1 → 0–3   (×1 = 0–3)
+          [F] RR bonus    = min(rr*2, 8)                 → 0–8   (×1 = 0–8)
+
+        Tổng: 0–92 → chuẩn hóa × (100/92)
+
+        Kết quả trả về list[dict] sorted giảm dần composite_score.
+        """
+        symbols = await self.fetcher.fetch_top_symbols(self.max_symbols)
+        logger.info(f"[/top] Composite scan: {len(symbols)} symbols (6TF + FVG 3TF)…")
+
+        BUFFER_MAP = {"1h": 0.003, "4h": 0.005, "1d": 0.010}
+        FRESH_LOOKBACK = 3
+        sem = asyncio.Semaphore(CONCURRENCY)
+
+        async def _analyse(sym: str) -> Optional[dict]:
+            async with sem:
+                try:
+                    # ── Fetch tất cả TF cần thiết ──────────────────────────
+                    (df5, df15, df30, df1h, df4h, df1d) = await asyncio.gather(
+                        self.fetcher.fetch_ohlcv(sym, "5m",  100),
+                        self.fetcher.fetch_ohlcv(sym, "15m", 100),
+                        self.fetcher.fetch_ohlcv(sym, "30m", 60),
+                        self.fetcher.fetch_ohlcv(sym, "1h",  100),
+                        self.fetcher.fetch_ohlcv(sym, "4h",  100),
+                        self.fetcher.fetch_ohlcv(sym, "1d",  60),
+                    )
+                    if df5 is None or len(df5) < 50:
+                        return None
+                    if df15 is None or len(df15) < 20:
+                        df15 = df5
+
+                    # ── [A] ULTRA score (full 6 TF) ────────────────────────
+                    sig = score_symbol(
+                        sym,
+                        df_5m=df5, df_15m=df15, df_30m=df30,
+                        df_1h=df1h, df_4h=df4h, df_1d=df1d,
+                    )
+                    ultra_max = max(
+                        sig.ultra_buy_score,  sig.ultra_sell_score,
+                        sig.ultra_1h_buy,     sig.ultra_1h_sell,
+                        sig.ultra_4h_buy,     sig.ultra_4h_sell,
+                        sig.ultra_1d_buy,     sig.ultra_1d_sell,
+                    )
+                    # Bỏ qua token quá yếu (không đủ điều kiện lệnh nào)
+                    if ultra_max < 6 and sig.score < 5:
+                        return None
+
+                    cur_price = sig.price
+                    if cur_price <= 0 and df15 is not None:
+                        cur_price = float(df15["close"].iloc[-1])
+
+                    # ── [B] FVG scan — thử cả 3 TF mỗi chiều ──────────────
+                    # Chọn df theo TF
+                    fvg_data = {"1h": df1h, "4h": df4h, "1d": df1d}
+                    score_df_map = {"15m": df15, "1h": df1h}
+
+                    best_fvg: Optional[dict] = None   # dict chứa kết quả FVG tốt nhất
+                    best_direction = "neutral"
+
+                    for fvg_tf, score_tf in [("4h", "15m"), ("1h", "15m"), ("1d", "1h")]:
+                        df_fvg   = fvg_data.get(fvg_tf)
+                        df_score = score_df_map.get(score_tf, df15)
+                        if df_fvg is None or len(df_fvg) < 3:
+                            continue
+                        if df_score is None or len(df_score) < 50:
+                            continue
+
+                        BUFFER = BUFFER_MAP.get(fvg_tf, 0.005)
+                        fvg_res = detect_fvg(df_fvg, min_gap_pct=0.0, max_keep=15)
+                        cur = fvg_res["cur_price"]
+                        if cur <= 0:
+                            continue
+
+                        # Thử Bull FVG (LONG setup)
+                        bull_fvgs = fvg_res["bull_fvgs"]
+                        ifvg_bear_sup = [f for f in fvg_res["ifvgs"]
+                                         if f.get("status", "") == "ifvg_bear"]
+                        bull_candidates = [(f, "bull") for f in bull_fvgs] + \
+                                          [(f, "ifvg_bear") for f in ifvg_bear_sup]
+
+                        for fvg, ftype in bull_candidates:
+                            top_buf = fvg["top"]    * (1 + BUFFER)
+                            bot_buf = fvg["bottom"] * (1 - BUFFER)
+                            if not (bot_buf <= cur <= top_buf):
+                                continue
+
+                            kwargs   = self._score_kwargs(score_tf, df_score, fvg_tf, df_fvg)
+                            res_buy  = score_symbol(sym, **kwargs)
+                            buy_sc   = res_buy.ultra_buy_score
+                            if buy_sc < 6:
+                                continue
+
+                            # Freshness
+                            prev_sc = 0
+                            if len(df_score) > FRESH_LOOKBACK + 50:
+                                df_prev  = df_score.iloc[:-FRESH_LOOKBACK]
+                                kw_prev  = self._score_kwargs(score_tf, df_prev, fvg_tf, df_fvg)
+                                prev_sc  = score_symbol(sym, **kw_prev).ultra_buy_score
+                            fresh = prev_sc < 6
+
+                            last_c  = df_score.iloc[-1]
+                            candle_ok = float(last_c["close"]) > float(last_c["open"])
+
+                            sweep_r  = detect_liquidity_sweep(df_score)
+                            liq_ok   = sweep_r["swept"] and sweep_r["sweep_type"] == "low"
+                            choch_r  = detect_choch(df_score)
+                            choch_ok = choch_r["choch_detected"] and choch_r["choch_type"] == "bull"
+
+                            mid  = (fvg["top"] + fvg["bottom"]) / 2
+                            dist = abs(cur - mid) / mid * 100 if mid > 0 else 99
+                            inside = fvg["bottom"] <= cur <= fvg["top"]
+
+                            vol_r  = detect_vol_spike_at_fvg(df_score, fvg["top"], fvg["bottom"])
+                            rr_r   = calc_fvg_rr(df_score, cur, fvg["top"], fvg["bottom"], "buy")
+
+                            if liq_ok and choch_ok and fresh and candle_ok:
+                                status = "🎰SNIPER"
+                            elif fresh and candle_ok:
+                                status = "🎯FRESH+CNF"
+                            elif fresh:
+                                status = "🆕FRESH"
+                            elif candle_ok:
+                                status = "✅CONFIRM"
+                            else:
+                                status = "📊ACTIVE"
+
+                            tier = "🔥" if buy_sc >= 9 and inside else ("⚡" if buy_sc >= 8 else "📌")
+                            fvg_info = {
+                                "direction": "LONG", "fvg_tf": fvg_tf, "score_tf": score_tf,
+                                "fvg_type": ftype, "fvg_top": fvg["top"], "fvg_bot": fvg["bottom"],
+                                "fvg_mid": round(mid, 6), "gap_pct": fvg["gap_pct"],
+                                "dist_pct": round(dist, 2), "inside": inside, "age_bars": fvg["age_bars"],
+                                "fvg_score": buy_sc, "prev_score": prev_sc,
+                                "signal_fresh": fresh, "candle_confirms": candle_ok,
+                                "signal_status": status, "tier": tier,
+                                "liq_swept": liq_ok, "liq_eq_type": sweep_r.get("eq_type", ""),
+                                "liq_level": sweep_r.get("sweep_level", 0.0),
+                                "liq_bars_ago": sweep_r.get("bars_ago", 0),
+                                "choch_ok": choch_ok, "choch_level": choch_r.get("choch_level", 0.0),
+                                "choch_bars_ago": choch_r.get("bars_ago", 0),
+                                "vol_spike": vol_r["vol_spike"], "vol_ratio": vol_r.get("vol_ratio", 1.0),
+                                "rr": rr_r.get("rr", 0.0), "rr_ok": rr_r["rr_ok"],
+                                "sl_price": rr_r.get("sl_price", 0.0), "tp_price": rr_r.get("tp_price", 0.0),
+                                "sl_pct": rr_r.get("sl_pct", 0.0), "tp_pct": rr_r.get("tp_pct", 0.0),
+                            }
+                            # Giữ FVG tốt nhất (score cao + gần mid)
+                            if best_fvg is None or buy_sc > best_fvg["fvg_score"] or \
+                               (buy_sc == best_fvg["fvg_score"] and dist < best_fvg["dist_pct"]):
+                                best_fvg = fvg_info
+                                best_direction = "LONG"
+
+                        # Thử Bear FVG (SHORT setup)
+                        bear_fvgs = fvg_res["bear_fvgs"]
+                        ifvg_bull_res = [f for f in fvg_res["ifvgs"]
+                                         if f.get("status", "") == "ifvg_bull"]
+                        bear_candidates = [(f, "bear") for f in bear_fvgs] + \
+                                          [(f, "ifvg_bull") for f in ifvg_bull_res]
+
+                        for fvg, ftype in bear_candidates:
+                            top_buf = fvg["top"]    * (1 + BUFFER)
+                            bot_buf = fvg["bottom"] * (1 - BUFFER)
+                            if not (bot_buf <= cur <= top_buf):
+                                continue
+
+                            kwargs    = self._score_kwargs(score_tf, df_score, fvg_tf, df_fvg)
+                            res_sell  = score_symbol(sym, **kwargs)
+                            sell_sc   = res_sell.ultra_sell_score
+                            if sell_sc < 6:
+                                continue
+
+                            prev_sc = 0
+                            if len(df_score) > FRESH_LOOKBACK + 50:
+                                df_prev  = df_score.iloc[:-FRESH_LOOKBACK]
+                                kw_prev  = self._score_kwargs(score_tf, df_prev, fvg_tf, df_fvg)
+                                prev_sc  = score_symbol(sym, **kw_prev).ultra_sell_score
+                            fresh = prev_sc < 6
+
+                            last_c  = df_score.iloc[-1]
+                            candle_ok = float(last_c["close"]) < float(last_c["open"])
+
+                            sweep_r  = detect_liquidity_sweep(df_score)
+                            liq_ok   = sweep_r["swept"] and sweep_r["sweep_type"] == "high"
+                            choch_r  = detect_choch(df_score)
+                            choch_ok = choch_r["choch_detected"] and choch_r["choch_type"] == "bear"
+
+                            mid  = (fvg["top"] + fvg["bottom"]) / 2
+                            dist = abs(cur - mid) / mid * 100 if mid > 0 else 99
+                            inside = fvg["bottom"] <= cur <= fvg["top"]
+
+                            vol_r  = detect_vol_spike_at_fvg(df_score, fvg["top"], fvg["bottom"])
+                            rr_r   = calc_fvg_rr(df_score, cur, fvg["top"], fvg["bottom"], "sell")
+
+                            if liq_ok and choch_ok and fresh and candle_ok:
+                                status = "🎰SNIPER"
+                            elif fresh and candle_ok:
+                                status = "🎯FRESH+CNF"
+                            elif fresh:
+                                status = "🆕FRESH"
+                            elif candle_ok:
+                                status = "✅CONFIRM"
+                            else:
+                                status = "📊ACTIVE"
+
+                            tier = "🔥" if sell_sc >= 9 and inside else ("⚡" if sell_sc >= 8 else "📌")
+                            fvg_info = {
+                                "direction": "SHORT", "fvg_tf": fvg_tf, "score_tf": score_tf,
+                                "fvg_type": ftype, "fvg_top": fvg["top"], "fvg_bot": fvg["bottom"],
+                                "fvg_mid": round(mid, 6), "gap_pct": fvg["gap_pct"],
+                                "dist_pct": round(dist, 2), "inside": inside, "age_bars": fvg["age_bars"],
+                                "fvg_score": sell_sc, "prev_score": prev_sc,
+                                "signal_fresh": fresh, "candle_confirms": candle_ok,
+                                "signal_status": status, "tier": tier,
+                                "liq_swept": liq_ok, "liq_eq_type": sweep_r.get("eq_type", ""),
+                                "liq_level": sweep_r.get("sweep_level", 0.0),
+                                "liq_bars_ago": sweep_r.get("bars_ago", 0),
+                                "choch_ok": choch_ok, "choch_level": choch_r.get("choch_level", 0.0),
+                                "choch_bars_ago": choch_r.get("bars_ago", 0),
+                                "vol_spike": vol_r["vol_spike"], "vol_ratio": vol_r.get("vol_ratio", 1.0),
+                                "rr": rr_r.get("rr", 0.0), "rr_ok": rr_r["rr_ok"],
+                                "sl_price": rr_r.get("sl_price", 0.0), "tp_price": rr_r.get("tp_price", 0.0),
+                                "sl_pct": rr_r.get("sl_pct", 0.0), "tp_pct": rr_r.get("tp_pct", 0.0),
+                            }
+                            if best_fvg is None or sell_sc > best_fvg["fvg_score"] or \
+                               (sell_sc == best_fvg["fvg_score"] and dist < best_fvg["dist_pct"]):
+                                best_fvg = fvg_info
+                                best_direction = "SHORT"
+
+                    # ── [C-F] Composite score ──────────────────────────────
+                    # [A] ULTRA max × 4
+                    part_a = ultra_max * 4
+
+                    # [B] FVG tier × 3
+                    STATUS_RANK = {
+                        "🎰SNIPER": 5, "🎯FRESH+CNF": 4, "🆕FRESH": 3,
+                        "✅CONFIRM": 2, "📊ACTIVE": 1,
+                    }
+                    fvg_tier_val = STATUS_RANK.get(
+                        best_fvg["signal_status"], 0) if best_fvg else 0
+                    part_b = fvg_tier_val * 3
+
+                    # [C] Confluence: Sweep + CHoCH + VolSpike + RR_ok
+                    if best_fvg:
+                        confluence = (
+                            int(best_fvg["liq_swept"]) +
+                            int(best_fvg["choch_ok"])  +
+                            int(best_fvg["vol_spike"]) +
+                            int(best_fvg["rr_ok"])
+                        )
+                    else:
+                        confluence = 0
+                    part_c = confluence * 3
+
+                    # [D] SXL score × 1
+                    part_d = sig.score
+
+                    # [E] Bonus
+                    part_e = (2 if sig.is_premium else 0) + (1 if sig.vol_confirm else 0)
+
+                    # [F] RR bonus
+                    rr_val = best_fvg["rr"] if best_fvg else 0.0
+                    part_f = min(rr_val * 2, 8)
+
+                    raw_score = part_a + part_b + part_c + part_d + part_e + part_f
+                    composite  = round(raw_score * 100 / 92, 1)
+
+                    # Xác định hướng cuối: ưu tiên FVG, fallback ULTRA
+                    if best_fvg:
+                        final_dir = best_fvg["direction"]
+                    elif sig.ultra_buy_score > sig.ultra_sell_score:
+                        final_dir = "LONG"
+                    elif sig.ultra_sell_score > sig.ultra_buy_score:
+                        final_dir = "SHORT"
+                    else:
+                        final_dir = sig.direction
+
+                    return {
+                        # ── Identity ────────────────────────────────────────
+                        "symbol":       sym,
+                        "direction":    final_dir,
+                        "cur_price":    cur_price,
+                        "composite":    composite,
+                        # ── Score components ────────────────────────────────
+                        "ultra_max":    ultra_max,
+                        "ultra_15m_b":  sig.ultra_buy_score,
+                        "ultra_15m_s":  sig.ultra_sell_score,
+                        "ultra_1h_b":   sig.ultra_1h_buy,
+                        "ultra_1h_s":   sig.ultra_1h_sell,
+                        "ultra_4h_b":   sig.ultra_4h_buy,
+                        "ultra_4h_s":   sig.ultra_4h_sell,
+                        "ultra_1d_b":   sig.ultra_1d_buy,
+                        "ultra_1d_s":   sig.ultra_1d_sell,
+                        "sxl_score":    sig.score,
+                        "is_premium":   sig.is_premium,
+                        "vol_confirm":  sig.vol_confirm,
+                        "leverage":     sig.leverage,
+                        "lev_risk":     sig.lev_risk,
+                        "atr_pct":      sig.atr_pct,
+                        "zone":         sig.zone,
+                        "ultra_verdict": (
+                            sig.ultra_verdict if final_dir != "SHORT"
+                            else sig.ultra_verdict
+                        ),
+                        "ultra_1h_verdict": sig.ultra_1h_verdict,
+                        "ultra_4h_verdict": sig.ultra_4h_verdict,
+                        "ultra_1d_verdict": sig.ultra_1d_verdict,
+                        "confluence":   confluence,
+                        "part_a":       part_a,
+                        "part_b":       part_b,
+                        "part_c":       part_c,
+                        "part_d":       part_d,
+                        "part_e":       part_e,
+                        "part_f":       round(part_f, 1),
+                        # ── Best FVG (nếu có) ────────────────────────────────
+                        "has_fvg":      best_fvg is not None,
+                        **(best_fvg if best_fvg else {
+                            "signal_status": "📊ACTIVE", "tier": "📌",
+                            "fvg_tf": "—", "score_tf": "—",
+                            "fvg_score": 0, "dist_pct": 99.0, "inside": False,
+                            "signal_fresh": False, "candle_confirms": False,
+                            "liq_swept": False, "choch_ok": False,
+                            "vol_spike": False, "vol_ratio": 1.0,
+                            "rr": 0.0, "rr_ok": False,
+                            "sl_price": 0.0, "tp_price": 0.0,
+                            "sl_pct": 0.0, "tp_pct": 0.0,
+                            "fvg_top": 0.0, "fvg_bot": 0.0, "fvg_mid": 0.0,
+                            "liq_level": 0.0, "liq_bars_ago": 0,
+                            "choch_level": 0.0, "choch_bars_ago": 0,
+                            "fvg_type": "—", "age_bars": 0, "gap_pct": 0.0,
+                        }),
+                    }
+                except Exception as e:
+                    logger.debug(f"composite {sym}: {e}")
+                    return None
+
+        results = await asyncio.gather(*[_analyse(s) for s in symbols])
+        hits = [r for r in results if r is not None]
+        hits.sort(key=lambda x: x["composite"], reverse=True)
+        logger.info(f"[/top] Composite done: {len(hits)} tokens")
+        return hits
+
+    # ──────────────────────────────────────────────────────────────────────
+    # PUBLIC WRAPPERS — mỗi lệnh bot gọi 1 trong các hàm này
+    # ──────────────────────────────────────────────────────────────────────
+
+    # /ft  — Bear FVG 4h  + 15m SELL
+    async def scan_ft(self)   -> list[dict]:
+        return await self._scan_bear_fvg("4h",  "15m")
+
+    # /ft1h — Bear FVG 1h  + 15m SELL
+    async def scan_ft1h(self) -> list[dict]:
+        return await self._scan_bear_fvg("1h",  "15m")
+
+    # /ft1d — Bear FVG 1d  + 1h  SELL  (khung daily → dùng 1h score)
+    async def scan_ft1d(self) -> list[dict]:
+        return await self._scan_bear_fvg("1d",  "1h")
+
+    # /fb   — Bull FVG 4h  + 15m BUY
+    async def scan_fb(self)   -> list[dict]:
+        return await self._scan_bull_fvg("4h",  "15m")
+
+    # /fb1h — Bull FVG 1h  + 15m BUY
+    async def scan_fb1h(self) -> list[dict]:
+        return await self._scan_bull_fvg("1h",  "15m")
+
+    # /fb1d — Bull FVG 1d  + 1h  BUY   (khung daily → dùng 1h score)
+    async def scan_fb1d(self) -> list[dict]:
+        return await self._scan_bull_fvg("1d",  "1h")
