@@ -1,23 +1,23 @@
 """
-Telegram bot v3.0
-Commands: /scan /top /check /status /debug /source /help
-
-Dashboard đầy đủ:
-  ① SXL Sniper (5 confluences Long/Short)
-  ② MSB-OB + Vol Balance + Spike + Leverage  (giữ từ v2)
-  ③ 15M ULTRA panel (NEW):
-       ST AI | UT Bot | SAR | SMC Swing | SMC Internal
-       Zone (PREM/EQ↑/EQ/EQ↓/DISC)
-       RSI MTF (6 TF)
-       MTF 3 tầng (Momentum 5m / Bridge 30m / Context 1h+4h+1d)
-       ULTRA Score 0–11 → Verdict
+Telegram bot — Ceez Prime + Buy Sell Signal
+Commands:
+  /scan        — Quét toàn market (4H ctx + 1H entry)
+  /scan4h1h    — 4H ctx + 1H entry  (default)
+  /scan1d4h    — 1D ctx + 4H entry  (swing)
+  /scan1h15m   — 1H ctx + 15m entry (intraday)
+  /top         — Top signal dạng rút gọn
+  /check BTC   — Phân tích chi tiết 1 token
+  /status      — Trạng thái bot
+  /debug       — Test kết nối
+  /help        — Danh sách lệnh
 """
+
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from scanner import Scanner
-from signals import SignalResult, detect_fvg
+from signals import SignalResult
 
 logger = logging.getLogger(__name__)
 
@@ -27,144 +27,92 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _yn(v: bool) -> str:
-    return "✓" if v else "✗"
+    return "✅" if v else "❌"
 
-def _arr(v: int | bool) -> str:
-    """1/True→▲  -1/False→▼  0→●"""
-    if v is True  or v == 1:  return "▲"
-    if v is False or v == -1: return "▼"
-    return "●"
+def _arr(v: bool) -> str:
+    return "▲" if v else "▼"
 
-def _rsi_bar(bull: int, bear: int) -> str:
-    """Tạo thanh RSI MTF 6 ô, ví dụ ▲▲▲▼●●"""
-    # placeholder: chỉ hiển thị count
-    return f"▲{bull}/6  ▼{bear}/6"
 
-def _score_bar(n: int, total: int = 6) -> str:
-    filled = min(n, total)
+def _score_bar(score: int, total: int = 7) -> str:
+    filled = min(score, total)
     return "█" * filled + "░" * (total - filled)
 
-def _mtf_line(momentum_b, momentum_bm, bridge_b, bridge_bm, ctx_b, ctx_bm) -> str:
-    def _flag(bull, bear):
-        if bull: return "✅"
-        if bear: return "🔴"
-        return "⬜"
-    return (
-        f"5m{_flag(momentum_b, momentum_bm)} "
-        f"30m{_flag(bridge_b,   bridge_bm)} "
-        f"1h+4h+1d{_flag(ctx_b, ctx_bm)}"
-    )
+
+def _dir_emoji(direction: str) -> str:
+    return {"LONG": "🟢", "SHORT": "🔴"}.get(direction, "⚪")
+
+
+def _fresh_tag(r: SignalResult) -> str:
+    if r.signal_fresh:
+        return f"🆕FRESH({r.cross_bars_ago}n)"
+    return f"📊{r.cross_bars_ago}n ago"
+
+
+def _fib_icon(zone: str) -> str:
+    return {
+        "DISC": "🟢", "EQ↓": "🟡", "EQ": "⚪",
+        "EQ↑": "🟡", "PREM": "🔴",
+    }.get(zone, "⚪")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# FORMAT FULL (dùng cho /check và /scan)
+# FORMAT FULL  (/check, /scan)
 # ══════════════════════════════════════════════════════════════════════════
 
-def _fmt(r: SignalResult) -> str:
-    dir_emoji = "🟢" if r.direction == "LONG" else ("🔴" if r.direction == "SHORT" else "⚪")
-    premium_line = f"⭐ *PREMIUM SIGNAL*\n" if r.is_premium else ""
+def _fmt(r: SignalResult, ctx_tf: str = "4H", entry_tf: str = "1H") -> str:
+    de   = _dir_emoji(r.direction)
+    bar  = _score_bar(r.score)
+    ftag = _fresh_tag(r)
 
-    spike_line = (
-        f"⚡ *Spike {'▲' if r.spike_direction == 'BULL' else '▼'} {r.spike_pct}%* — Cẩn thận!\n"
-        if r.is_spike else f"⚡ Spike: OK ({r.spike_pct}%)\n"
+    # ── SL/TP block ───────────────────────────────────────────────────────
+    sl_tp_block = ""
+    if r.direction != "NEUTRAL":
+        sl_tp_block = (
+            f"{'─' * 30}\n"
+            f"💰 Entry  : `{r.price}`\n"
+            f"🛑 SL     : `{r.sl}`  (-{r.risk_pct:.2f}%)\n"
+            f"🎯 TP1(1R): `{r.tp1}`\n"
+            f"🎯 TP2(2R): `{r.tp2}`\n"
+            f"🏁 TP Final({r.rr:.1f}R): `{r.tp_final}`\n"
+            f"📐 ATR    : `{r.atr:.6f}`\n"
+        )
+
+    # ── Context block (Ceez Prime) ────────────────────────────────────────
+    struct_str = "/".join(r.struct_labels) if r.struct_labels else "N/A"
+    fib_icon   = _fib_icon(r.fib_zone)
+
+    ctx_block = (
+        f"{'─' * 30}\n"
+        f"📊 *Ceez Prime — {ctx_tf} Context* `{r.score}/7`\n"
+        f"  `{bar}`\n"
+        f"  EMA Stack : {_yn(r.ema_stack)}  "
+        f"13={r.ema_e13:.4f} 20={r.ema_e20:.4f}\n"
+        f"  50={r.ema_e50:.4f} 200={r.ema_e200:.4f}\n"
+        f"  LinReg    : {_yn(r.linreg_bull)} slope={r.linreg_slope:.8f}\n"
+        f"  Structure : {_yn(r.struct_ok)}  [{struct_str}]\n"
+        f"  Fib Zone  : {fib_icon} {r.fib_zone} ({r.fib_pct:.1f}%)  {_yn(r.fib_ok)}\n"
+        f"  CCI(20)   : {_yn(r.cci_ok)}  val={r.cci_val:.1f}\n"
+        f"  ADX(14)   : {_yn(r.adx_ok)}  ADX={r.adx_val:.1f}  "
+        f"DI+={r.di_plus:.1f}  DI-={r.di_minus:.1f}\n"
     )
 
-    vol_icon    = "📈" if r.bull_pct > r.bear_pct else "📉"
-    vol_dom     = " ⚠️ Dominant" if max(r.bull_pct, r.bear_pct) >= 65 else ""
-    vol_conf    = "✓ Confirms" if r.vol_confirm else "✗ Against"
-    lev_bar     = "█" * min(r.leverage, 10) + "░" * max(0, 10 - r.leverage)
-    tags        = " | ".join(r.reasons[:8]) if r.reasons else "—"
-
-    # ── UT Bot text ──────────────────────────────────────────────────────
-    ut_txt = "LONG" if r.ut_pos_val == 1 else ("SHORT" if r.ut_pos_val == -1 else "FLAT")
-
-    # ── Zone color hint ──────────────────────────────────────────────────
-    zone_icon = {
-        "PREM": "🔴", "EQ↑": "🟡", "EQ": "⚪",
-        "EQ↓":  "🟡", "DISC": "🟢",
-    }.get(r.zone, "⚪")
-
-    # ── RSI bar ──────────────────────────────────────────────────────────
-    rsi_bar = _rsi_bar(r.rsi_bull_count, r.rsi_bear_count)
-
-    # ── MTF 3 tầng ───────────────────────────────────────────────────────
-    mtf_txt = _mtf_line(
-        r.mtf_momentum_bull, r.mtf_momentum_bear,
-        r.mtf_bridge_bull,   r.mtf_bridge_bear,
-        r.mtf_context_bull,  r.mtf_context_bear,
+    # ── Entry block (Buy Sell Signal) ─────────────────────────────────────
+    entry_block = (
+        f"{'─' * 30}\n"
+        f"🎯 *Buy Sell Signal — {entry_tf} Entry*\n"
+        f"  EMA5×13 Cross  : {_yn(r.entry_cross)}\n"
+        f"  Candle Confirm : {_yn(r.candle_confirm)}\n"
+        f"  Signal Status  : {ftag}\n"
     )
 
-    # ── Ultra score bar (15m) ─────────────────────────────────────────────
-    ultra_max    = max(r.ultra_buy_score, r.ultra_sell_score)
-    ultra_bar    = "█" * ultra_max + "░" * (11 - ultra_max)
-    ultra_side   = "↑" if r.ultra_buy_score >= r.ultra_sell_score else "↓"
-    ultra_color  = "🟢" if r.ultra_verdict_color == "green" else ("🔴" if r.ultra_verdict_color == "red" else "⬜")
-
-    # ── Ultra 1h / 4h ────────────────────────────────────────────────────
-    def _uc(color): return "🟢" if color == "green" else ("🔴" if color == "red" else "⬜")
-    def _ubar(b, s): m = max(b, s); return "█" * m + "░" * (11 - m)
-
-    u1h_color = _uc(r.ultra_1h_color)
-    u4h_color = _uc(r.ultra_4h_color)
-    u1d_color = _uc(r.ultra_1d_color)
-    u1h_bar   = _ubar(r.ultra_1h_buy, r.ultra_1h_sell)
-    u4h_bar   = _ubar(r.ultra_4h_buy, r.ultra_4h_sell)
-    u1d_bar   = _ubar(r.ultra_1d_buy, r.ultra_1d_sell)
+    # ── Reasons ───────────────────────────────────────────────────────────
+    tags = " | ".join(r.reasons[:8]) if r.reasons else "—"
 
     msg = (
-        f"{dir_emoji} *{r.symbol}*  [{r.direction}]  SXL: *{r.score}/10*\n"
-        f"{premium_line}"
-        f"{'─' * 30}\n"
-        f"💰 Price  : `{r.price}`\n"
-        f"🛑 SL     : `{r.sl}`\n"
-        f"🎯 TP1    : `{r.tp1}`\n"
-        f"🎯 TP2    : `{r.tp2}`\n"
-        f"{'─' * 30}\n"
-        f"📐 *SXL Confluences*\n"
-        f"  LONG {r.l_score}/5 | SHORT {r.s_score}/5\n"
-        f"  MSB Bias: {r.market_bias} | OB/BB Zone: {_yn(r.in_ob_zone)}\n"
-        f"{'─' * 30}\n"
-        f"⚡ *15M ULTRA Indicators*\n"
-        f"  ST-AI : {_arr(r.st_ai_bull)} (factor {r.st_ai_factor:.1f})\n"
-        f"  UT Bot: {_arr(r.ut_pos_val)} ({ut_txt})\n"
-        f"  SAR   : {_arr(r.sar_bull_val)}\n"
-        f"  SMC Sw: {_arr(r.smc_swing_bull)} | SMC In: {_arr(r.smc_int_bull)}\n"
-        f"  Zone  : {zone_icon} *{r.zone}* ({r.zone_pct}%)\n"
-        f"{'─' * 30}\n"
-        f"📊 *RSI MTF*  {rsi_bar}\n"
-        f"{'─' * 30}\n"
-        f"🔗 *MTF 3 Tầng*\n"
-        f"  {mtf_txt}\n"
-        f"{'─' * 30}\n"
-        f"🏆 *ULTRA Score (15m)*\n"
-        f"  {ultra_color} BUY {r.ultra_buy_score}↑ / SELL {r.ultra_sell_score}↓ /11\n"
-        f"  `{ultra_bar}` {ultra_side}\n"
-        f"  Verdict: *{r.ultra_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"⏱ *ULTRA Score 1H*\n"
-        f"  {u1h_color} BUY {r.ultra_1h_buy}↑ / SELL {r.ultra_1h_sell}↓ /11\n"
-        f"  `{u1h_bar}`\n"
-        f"  Verdict: *{r.ultra_1h_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"⏱ *ULTRA Score 4H*\n"
-        f"  {u4h_color} BUY {r.ultra_4h_buy}↑ / SELL {r.ultra_4h_sell}↓ /11\n"
-        f"  `{u4h_bar}`\n"
-        f"  Verdict: *{r.ultra_4h_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"📅 *ULTRA Score 1D*\n"
-        f"  {u1d_color} BUY {r.ultra_1d_buy}↑ / SELL {r.ultra_1d_sell}↓ /11\n"
-        f"  `{u1d_bar}`\n"
-        f"  Verdict: *{r.ultra_1d_verdict}*\n"
-        f"{'─' * 30}\n"
-        f"{vol_icon} *Volume Balance*\n"
-        f"  ▲ Bull: {r.bull_pct}%  |  ▼ Bear: {r.bear_pct}%{vol_dom}\n"
-        f"  Vol {vol_conf}\n"
-        f"{'─' * 30}\n"
-        f"{spike_line}"
-        f"{'─' * 30}\n"
-        f"🎚 *Leverage Advisor*\n"
-        f"  Gợi ý: *{r.leverage}x*  {r.lev_risk}\n"
-        f"  ATR% = {r.atr_pct}%  [{lev_bar}]\n"
+        f"{de} *{r.symbol}*  [{r.direction}]  Score: *{r.score}/7*\n"
+        f"{sl_tp_block}"
+        f"{ctx_block}"
+        f"{entry_block}"
         f"{'─' * 30}\n"
         f"📌 {tags}"
     )
@@ -172,37 +120,36 @@ def _fmt(r: SignalResult) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# FORMAT SHORT (dùng cho /top)
+# FORMAT SHORT  (/top, /scan list)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _fmt_short(r: SignalResult) -> str:
-    dir_emoji = "🟢" if r.direction == "LONG" else ("🔴" if r.direction == "SHORT" else "⚪")
-    prem  = " ★"           if r.is_premium else ""
-    spk   = f" ⚡{r.spike_pct}%" if r.is_spike else ""
-    vc    = r.ultra_verdict_color
-    v_em  = "🟢" if vc == "green" else ("🔴" if vc == "red" else "⬜")
-    zone_icon = {
-        "PREM": "🔴", "EQ↑": "🟡", "EQ": "⚪", "EQ↓": "🟡", "DISC": "🟢",
-    }.get(r.zone, "⚪")
-    ut_txt = "L" if r.ut_pos_val == 1 else ("S" if r.ut_pos_val == -1 else "—")
-    mtf_ctx = "✅" if (r.mtf_context_bull or r.mtf_context_bear) else "⬜"
+    de   = _dir_emoji(r.direction)
+    ftag = _fresh_tag(r)
+    fib  = _fib_icon(r.fib_zone)
+    bar  = _score_bar(r.score)
 
-    def _uc(c): return "🟢" if c == "green" else ("🔴" if c == "red" else "⬜")
-    u1h_em = _uc(r.ultra_1h_color)
-    u4h_em = _uc(r.ultra_4h_color)
-    u1d_em = _uc(r.ultra_1d_color)
+    ctx_icons = (
+        f"EMA{_yn(r.ema_stack)} "
+        f"LR{_yn(r.linreg_bull)} "
+        f"MS{_yn(r.struct_ok)} "
+        f"Fib{fib}{_yn(r.fib_ok)} "
+        f"CCI{_yn(r.cci_ok)} "
+        f"ADX{_yn(r.adx_ok)}"
+    )
+
+    sl_tp = ""
+    if r.direction != "NEUTRAL":
+        sl_tp = (
+            f"  💰`{r.price}` 🛑`{r.sl}`(-{r.risk_pct:.1f}%) "
+            f"🎯`{r.tp1}` 🏁`{r.tp_final}`\n"
+        )
 
     return (
-        f"{dir_emoji} *{r.symbol}*{prem}  SXL:`{r.score}/10`  15m:`{r.ultra_buy_score}↑{r.ultra_sell_score}↓`{spk}\n"
-        f"  {v_em} *{r.ultra_verdict}*  "
-        f"1H:{u1h_em}`{r.ultra_1h_buy}↑{r.ultra_1h_sell}↓` *{r.ultra_1h_verdict}*\n"
-        f"  4H:{u4h_em}`{r.ultra_4h_buy}↑{r.ultra_4h_sell}↓` *{r.ultra_4h_verdict}*  "
-        f"1D:{u1d_em}`{r.ultra_1d_buy}↑{r.ultra_1d_sell}↓` *{r.ultra_1d_verdict}*\n"
-        f"  ST-AI:{_arr(r.st_ai_bull)} UT:{ut_txt} SAR:{_arr(r.sar_bull_val)} "
-        f"Zone:{zone_icon}{r.zone}({r.zone_pct}%) CTX:{mtf_ctx}\n"
-        f"  RSI▲{r.rsi_bull_count}/6 ▼{r.rsi_bear_count}/6 | "
-        f"Vol▲{r.bull_pct}%/▼{r.bear_pct}% | Lev:{r.leverage}x {r.lev_risk}\n"
-        f"  💰`{r.price}` 🛑`{r.sl}` 🎯`{r.tp1}`"
+        f"{de} *{r.symbol}*  {r.direction}  `{r.score}/7`  {ftag}\n"
+        f"  `{bar}`\n"
+        f"  {ctx_icons}\n"
+        f"{sl_tp}"
     )
 
 
@@ -215,130 +162,143 @@ class TelegramBot:
         self.token   = token
         self.scanner = scanner
         self.app     = Application.builder().token(token).build()
-        for cmd, fn in [
+
+        cmds = [
             ("start",    self._start),
             ("help",     self._help),
             ("scan",     self._scan),
+            ("scan4h1h", self._scan_4h1h),
+            ("scan1d4h", self._scan_1d4h),
+            ("scan1h15m",self._scan_1h15m),
             ("top",      self._top),
-            ("strong",   self._strong),
-            ("fvg",      self._fvg),
-            ("fvgscan",  self._fvgscan),
-            ("ft",       self._ft),
-            ("ft1h",     self._ft1h),
-            ("ft1d",     self._ft1d),
-            ("fb",       self._fb),
-            ("fb1h",     self._fb1h),
-            ("fb1d",     self._fb1d),
-            ("4h",       self._scan_4h),
             ("check",    self._check),
             ("status",   self._status),
             ("debug",    self._debug),
-            ("source",   self._source),
-        ]:
+        ]
+        for cmd, fn in cmds:
             self.app.add_handler(CommandHandler(cmd, fn))
+
+    # ── Start / Help ───────────────────────────────────────────────────────
 
     async def _start(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            "🤖 *SXL Sniper + 15M ULTRA Bot* v3.0 sẵn sàng!\n"
-            "Dùng /help xem lệnh.",
+            "🤖 *Ceez Prime + Buy Sell Signal Bot* sẵn sàng!\n"
+            "Dùng /help xem danh sách lệnh.",
             parse_mode="Markdown"
         )
 
     async def _help(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        lines = (
+        text = (
             "📖 *Danh sách lệnh*\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔍 *Quét toàn market*\n"
-            "/scan    — Quét toàn bộ, liệt kê token ULTRA ≥ 8\n"
-            "/top     — Top signal mạnh nhất hiện tại\n"
-            "/strong  — Token có STRONG signal trên khung 1D\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔴 *Setup SHORT — giá chạm Bear FVG*\n"
-            "_FVG kháng cự + SELL score xác nhận xu hướng giảm_\n"
-            "/ft      — Bear FVG 4h  ×  SELL score 15m\n"
-            "/ft1h    — Bear FVG 1h  ×  SELL score 15m\n"
-            "/ft1d    — Bear FVG 1D  ×  SELL score 1h\n"
-            "_Tier: 🔥 sell≥9+trong  ⚡ sell≥8  📌 sell≥6_\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🟢 *Setup LONG — giá chạm Bull FVG*\n"
-            "_FVG hỗ trợ + BUY score xác nhận xu hướng tăng_\n"
-            "/fb      — Bull FVG 4h  ×  BUY score 15m\n"
-            "/fb1h    — Bull FVG 1h  ×  BUY score 15m\n"
-            "/fb1d    — Bull FVG 1D  ×  BUY score 1h\n"
-            "_Tier: 🔥 buy≥9+trong   ⚡ buy≥8   📌 buy≥6_\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📈 *Setup LONG — EMA Cross + LinReg Bull*\n"
-            "_EMA 5/13 vừa cross lên + kênh hồi quy slope xanh trên 4H_\n"
-            "/4h      — EMA 5/13 cross ↑ × LinReg channel bull (4H)\n"
-            "_Tier: 🔥 slope mạnh  ⚡ slope vừa  📌 slope yếu_\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "📐 *FVG thủ công*\n"
-            "/fvgscan `[tf]`  — Toàn market đang NẰM TRONG FVG\n"
-            "  tf mặc định: 4h  |  hỗ trợ: 5m 15m 30m 1h 4h 1d\n"
-            "/fvg `BTC [tf]`  — Xem FVG bull/bear/ifvg của 1 token\n"
-            "  ví dụ: /fvg ETH 1h\n"
+            "/scan      — 4H context + 1H entry  (default)\n"
+            "/scan4h1h  — 4H context + 1H entry\n"
+            "/scan1d4h  — 1D context + 4H entry  (swing)\n"
+            "/scan1h15m — 1H context + 15m entry (intraday)\n"
+            "/top       — Top signal rút gọn\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "🔎 *Phân tích 1 token*\n"
-            "/check `BTC`     — Dashboard đầy đủ 6 TF (ULTRA + SXL)\n"
+            "/check `BTC`   — Dashboard đầy đủ\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "⚙️ *Hệ thống*\n"
-            "/status  — Trạng thái bot & cấu hình hiện tại\n"
-            "/debug   — Test kết nối API OKX\n"
-            "/source  — Xem nguồn dữ liệu đang dùng\n"
+            "/status  — Trạng thái bot\n"
+            "/debug   — Test kết nối OKX\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "*Logic vào lệnh:*\n"
+            "① Ceez Prime xác nhận context (6 điểm)\n"
+            "   EMA Stack 13/20/50/200\n"
+            "   LinReg slope\n"
+            "   Structure HH/HL hoặc LH/LL\n"
+            "   Fibonacci zone (0.382–0.618)\n"
+            "   CCI > 0 hoặc < 0\n"
+            "   ADX > 20 + DI xác nhận\n"
+            "② Buy Sell Signal kích hoạt (1 điểm)\n"
+            "   EMA 5 cross EMA 13 + nến xác nhận\n"
+            "*Ngưỡng vào: score ≥ 4/7 + ADX trending*"
         )
-        await u.message.reply_text(lines, parse_mode="Markdown")
+        await u.message.reply_text(text, parse_mode="Markdown")
 
-    async def _scan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text("🔍 Đang quét token (6 TF/symbol)... (~90s)")
-        signals = await self.scanner.scan_all()
+    # ── Scan helpers ──────────────────────────────────────────────────────
+
+    async def _do_scan(
+        self,
+        u:        Update,
+        ctx_tf:   str,
+        entry_tf: str,
+        label:    str,
+    ):
+        await u.message.reply_text(
+            f"🔍 Đang quét *{label}* (~60–90s)...",
+            parse_mode="Markdown"
+        )
+
+        if ctx_tf == self.scanner.ctx_tf and entry_tf == self.scanner.entry_tf:
+            signals = await self.scanner.scan_all()
+        else:
+            signals = await self.scanner.scan_tf(ctx_tf, entry_tf)
+
         if not signals:
             await u.message.reply_text(
-                "❌ Không có tín hiệu ultra≥8 lúc này.\n"
-                "Dùng /debug để kiểm tra kết nối."
+                f"❌ Không có tín hiệu [{label}] lúc này.\n"
+                f"Thử /debug kiểm tra kết nối."
             )
             return
 
-        strong   = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
-                                              r.ultra_1h_buy, r.ultra_1h_sell,
-                                              r.ultra_4h_buy, r.ultra_4h_sell,
-                                              r.ultra_1d_buy, r.ultra_1d_sell) >= 9]
-        mid      = [r for r in signals if max(r.ultra_buy_score, r.ultra_sell_score,
-                                              r.ultra_1h_buy, r.ultra_1h_sell,
-                                              r.ultra_4h_buy, r.ultra_4h_sell,
-                                              r.ultra_1d_buy, r.ultra_1d_sell) == 8]
-        premiums = [r for r in signals if r.is_premium]
-        spikes   = [r for r in signals if r.is_spike]
+        long_s  = [r for r in signals if r.direction == "LONG"]
+        short_s = [r for r in signals if r.direction == "SHORT"]
+        fresh_s = [r for r in signals if r.signal_fresh]
+        full_s  = [r for r in signals if r.score == 7]
 
-        # Gửi summary trước
         await u.message.reply_text(
-            f"📊 *Kết quả scan* — {len(signals)} tín hiệu (ultra≥8)\n"
-            f"🚀 STRONG (ULTRA≥9): {len(strong)}\n"
-            f"✅ BUY/SELL (ULTRA=8): {len(mid)}\n"
-            f"⭐ Premium: {len(premiums)}  ⚡ Spike: {len(spikes)}\n"
+            f"📊 *{label}* — {len(signals)} tín hiệu\n"
+            f"🟢 LONG: {len(long_s)}  🔴 SHORT: {len(short_s)}\n"
+            f"🆕 Fresh: {len(fresh_s)}  ⭐ Full(7/7): {len(full_s)}\n"
             f"_(Gửi từng signal bên dưới…)_",
             parse_mode="Markdown"
         )
 
-        # Gửi TẤT CẢ signal — full format, không giới hạn số lượng
         for r in signals:
-            await u.message.reply_text(_fmt(r), parse_mode="Markdown")
+            try:
+                await u.message.reply_text(
+                    _fmt(r, ctx_tf.upper(), entry_tf.upper()),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.warning(f"send {r.symbol}: {e}")
 
         await u.message.reply_text(
             f"✅ *Xong!* Đã gửi {len(signals)} tín hiệu.",
             parse_mode="Markdown"
         )
 
+    async def _scan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        await self._do_scan(u, self.scanner.ctx_tf, self.scanner.entry_tf,
+                            f"{self.scanner.ctx_tf.upper()} ctx + {self.scanner.entry_tf.upper()} entry")
+
+    async def _scan_4h1h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        await self._do_scan(u, "4h", "1h", "4H ctx + 1H entry")
+
+    async def _scan_1d4h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        await self._do_scan(u, "1d", "4h", "1D ctx + 4H entry  [SWING]")
+
+    async def _scan_1h15m(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        await self._do_scan(u, "1h", "15m", "1H ctx + 15m entry  [INTRADAY]")
+
+    # ── /top ──────────────────────────────────────────────────────────────
+
     async def _top(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text("🔍 Đang lấy top tín hiệu (ultra≥8)...")
+        await u.message.reply_text("🔍 Đang lấy top tín hiệu...")
         signals = await self.scanner.scan_all()
         if not signals:
             await u.message.reply_text("❌ Không có tín hiệu. Dùng /debug kiểm tra.")
             return
-        lines = [f"🏆 *Top Tín Hiệu (ultra≥8)* — {len(signals)} token\n"]
+
+        lines = [f"🏆 *Top Tín Hiệu* — {len(signals)} token\n"]
         for i, r in enumerate(signals, 1):
-            badge = "🚀" if max(r.ultra_buy_score, r.ultra_sell_score) >= 9 else "✅"
+            badge = "⭐" if r.score == 7 else ("🔥" if r.score >= 5 else "📌")
             lines.append(f"*#{i}* {badge} {_fmt_short(r)}\n")
-        # Chia nhỏ nếu quá 4096 ký tự
+
         chunk = ""
         for line in lines:
             if len(chunk) + len(line) > 3800:
@@ -349,585 +309,7 @@ class TelegramBot:
         if chunk:
             await u.message.reply_text(chunk, parse_mode="Markdown")
 
-    async def _strong(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /strong — hiển thị các token có ULTRA 1D STRONG BUY hoặc STRONG SELL (≥9).
-        Dùng ngưỡng thấp hơn khi scan (bỏ qua min_score bình thường) để không bỏ sót.
-        """
-        await u.message.reply_text("📅 Đang quét 1D STRONG (ultra_1d ≥ 9)... (~90s)")
-
-        # Scan toàn bộ với ignore_threshold để lấy mọi kết quả, sau đó tự lọc
-        symbols = await self.scanner.fetcher.fetch_top_symbols(self.scanner.max_symbols)
-
-        import asyncio
-        from scanner import CONCURRENCY
-        sem = asyncio.Semaphore(CONCURRENCY)
-
-        async def _fetch_one(sym):
-            async with sem:
-                return await self.scanner._analyse_one(sym, ignore_threshold=True)
-
-        results = await asyncio.gather(*[_fetch_one(s) for s in symbols])
-
-        # Lọc chỉ giữ token có 1D STRONG BUY hoặc STRONG SELL
-        strong_1d = [
-            r for r in results
-            if r is not None and (r.ultra_1d_buy >= 9 or r.ultra_1d_sell >= 9)
-        ]
-
-        # Sort: 1D score cao nhất trước
-        strong_1d.sort(
-            key=lambda x: max(x.ultra_1d_buy, x.ultra_1d_sell),
-            reverse=True,
-        )
-
-        if not strong_1d:
-            await u.message.reply_text(
-                "❌ Không có token nào đạt 1D STRONG (ultra_1d ≥ 9) lúc này.\n"
-                "Dùng /scan để xem tín hiệu ngắn hạn."
-            )
-            return
-
-        buy_cnt  = sum(1 for r in strong_1d if r.ultra_1d_buy >= r.ultra_1d_sell)
-        sell_cnt = len(strong_1d) - buy_cnt
-
-        await u.message.reply_text(
-            f"📅 *1D STRONG* — {len(strong_1d)} token\n"
-            f"🟢 STRONG BUY: {buy_cnt}  |  🔴 STRONG SELL: {sell_cnt}\n"
-            f"_(Gửi từng signal bên dưới…)_",
-            parse_mode="Markdown"
-        )
-
-        for r in strong_1d:
-            # Tạo prefix rõ hướng 1D
-            if r.ultra_1d_buy >= 9 and r.ultra_1d_buy >= r.ultra_1d_sell:
-                label = f"📅🟢 *1D STRONG BUY* — score {r.ultra_1d_buy}/11"
-            else:
-                label = f"📅🔴 *1D STRONG SELL* — score {r.ultra_1d_sell}/11"
-            await u.message.reply_text(
-                f"{label}\n\n{_fmt(r)}",
-                parse_mode="Markdown"
-            )
-
-        await u.message.reply_text(
-            f"✅ *Xong!* Đã gửi {len(strong_1d)} token 1D STRONG.",
-            parse_mode="Markdown"
-        )
-
-    # ── Shared display helper ─────────────────────────────────────────────
-
-    async def _send_fvg_hits(
-        self,
-        u: Update,
-        hits: list[dict],
-        direction: str,   # "sell" hoặc "buy"
-        fvg_tf: str,
-        score_tf: str,
-    ):
-        """
-        Render và gửi kết quả FVG scan (dùng chung cho /ft* và /fb*).
-        direction : "sell" → Bear FVG / "buy" → Bull FVG
-
-        Ưu tiên hiển thị: 🎰SNIPER > 🎯FRESH+CNF > 🆕FRESH > ✅CONFIRM > 📊ACTIVE
-        (hits đã được scanner sort theo STATUS_RANK trước khi truyền vào)
-        """
-        is_sell   = (direction == "sell")
-        dir_em    = "🔴" if is_sell else "🟢"
-        fvg_lbl   = "Bear FVG" if is_sell else "Bull FVG"
-        setup     = "SHORT"     if is_sell else "LONG"
-        score_key = "sell_score" if is_sell else "buy_score"
-        score_lbl = "SELL"       if is_sell else "BUY"
-        cnf_dir   = "nến bearish↓" if is_sell else "nến bullish↑"
-
-        # ── Đếm theo status ─────────────────────────────────────────────────
-        sniper    = [h for h in hits if h.get("signal_status") == "🎰SNIPER"]
-        fresh_cnf = [h for h in hits if h.get("signal_status") == "🎯FRESH+CNF"]
-        fresh     = [h for h in hits if h.get("signal_status") == "🆕FRESH"]
-        confirm   = [h for h in hits if h.get("signal_status") == "✅CONFIRM"]
-        active    = [h for h in hits if h.get("signal_status") == "📊ACTIVE"]
-
-        rr_ok_cnt  = sum(1 for h in hits if h.get("rr_ok"))
-        sweep_cnt  = sum(1 for h in hits if h.get("liq_swept"))
-        choch_cnt  = sum(1 for h in hits if h.get("choch_ok"))
-        vol_cnt    = sum(1 for h in hits if h.get("vol_spike"))
-
-        # ── Row renderer ────────────────────────────────────────────────────
-        def _row(h: dict) -> str:
-            sym    = h["symbol"].replace("USDT", "")
-            ftype  = h.get("fvg_type", direction)
-            f_em   = "🔵" if "ifvg" in ftype else dir_em
-            f_lbl  = (f"iFVG-{'Bear' if is_sell else 'Bull'}"
-                      if "ifvg" in ftype
-                      else f"{'Bear' if is_sell else 'Bull'}FVG")
-            pos    = "✅trong" if h.get("inside") else "🔔gần"
-            ab_mid = "↑" if h["cur_price"] >= h["fvg_mid"] else "↓"
-            sc     = h.get(score_key, 0)
-            prev   = h.get("prev_score", 0)
-            status = h.get("signal_status", "📊ACTIVE")
-
-            # Dòng 1: symbol + status + giá
-            line1 = f"{h['tier']} *{sym}*  {status}  `{h['cur_price']:.4f}`\n"
-
-            # Dòng 2: FVG + score + freshness + confirmation
-            fresh_tag = f"  📈{prev}→{sc}" if h.get("signal_fresh") else ""
-            cnf_tag   = f"  {cnf_dir}"     if h.get("candle_confirms") else ""
-            line2 = (
-                f"  {f_em}{f_lbl} {pos}  {score_lbl}:`{sc}/11`"
-                f"{fresh_tag}{cnf_tag}\n"
-            )
-
-            # Dòng 3: FVG levels + khoảng cách
-            line3 = (
-                f"  FVG:`{h['fvg_bot']:.4f}`–`{h['fvg_top']:.4f}`"
-                f"  Mid{ab_mid}:`{h['dist_pct']:.2f}%`  _{h['age_bars']}nến_\n"
-            )
-
-            # Dòng 4: Sweep + CHoCH (nếu có)
-            extras = []
-            if h.get("liq_swept"):
-                extras.append(
-                    f"💧Sweep {h.get('liq_eq_type','')} "
-                    f"`{h.get('liq_level',0):.4f}` "
-                    f"({h.get('liq_bars_ago',0)}n trước)"
-                )
-            if h.get("choch_ok"):
-                extras.append(
-                    f"🔄CHoCH `{h.get('choch_level',0):.4f}` "
-                    f"({h.get('choch_bars_ago',0)}n trước)"
-                )
-            line4 = ("  " + "  ".join(extras) + "\n") if extras else ""
-
-            # Dòng 5: Volume + RR
-            vol_r   = h.get("vol_ratio", 1.0)
-            vol_tag = f"⚡Vol×{vol_r:.1f}" if h.get("vol_spike") else f"Vol×{vol_r:.1f}"
-            rr      = h.get("rr", 0.0)
-            rr_em   = "🟢" if h.get("rr_ok") else "🟡"
-            rr_tag  = f"{rr_em}RR:{rr:.1f}"
-            sl_p    = h.get("sl_price", 0.0)
-            tp_p    = h.get("tp_price", 0.0)
-            sl_pct  = h.get("sl_pct", 0.0)
-            tp_pct  = h.get("tp_pct", 0.0)
-            line5 = (
-                f"  {vol_tag}  {rr_tag}"
-                f"  🛑`{sl_p:.4f}`(-{sl_pct:.2f}%)"
-                f"  🎯`{tp_p:.4f}`(+{tp_pct:.2f}%)\n"
-            )
-
-            return line1 + line2 + line3 + line4 + line5
-
-        # ── Header ──────────────────────────────────────────────────────────
-        header = (
-            f"{dir_em} *{fvg_lbl} {fvg_tf.upper()} + {score_tf} {score_lbl}*"
-            f" — {len(hits)} token\n"
-            f"🎰 Sniper:{len(sniper)}  🎯 Fresh+Cnf:{len(fresh_cnf)}"
-            f"  🆕 Fresh:{len(fresh)}  ✅ Cnf:{len(confirm)}  📊 Active:{len(active)}\n"
-            f"💧 Sweep:{sweep_cnt}  🔄 CHoCH:{choch_cnt}"
-            f"  ⚡ VolSpike:{vol_cnt}  🟢 RR≥1.5:{rr_ok_cnt}\n"
-            f"_SL=ngoài FVG+0.2%  TP=swing liq gần nhất_\n"
-            f"{'─'*30}\n"
-        )
-
-        # ── Sections — theo status priority ──────────────────────────────────
-        STATUS_GROUPS = [
-            ("🎰SNIPER",    sniper,
-             "🎰 *SNIPER* — Sweep + CHoCH + Fresh + Confirm  ← VÀO LỆNH"),
-            ("🎯FRESH+CNF", fresh_cnf,
-             "🎯 *FRESH + XÁC NHẬN* — entry tốt"),
-            ("🆕FRESH",     fresh,
-             "🆕 *FRESH* — chờ nến xác nhận đóng cửa"),
-            ("✅CONFIRM",   confirm,
-             "✅ *CONFIRM* — nến ok, signal không mới"),
-            ("📊ACTIVE",    active,
-             "📊 *ACTIVE* — signal cũ, theo dõi"),
-        ]
-
-        sections = []
-        for _key, group, label in STATUS_GROUPS:
-            if not group:
-                continue
-            sections.append(f"{label} ({len(group)})\n")
-            for h in group:
-                sections.append(_row(h))
-            sections.append("\n")
-
-        # ── Gửi ─────────────────────────────────────────────────────────────
-        chunk = header
-        for line in sections:
-            if len(chunk) + len(line) > 3900:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = line
-            else:
-                chunk += line
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
-
-    # ── /ft family (Bear FVG + SELL) ─────────────────────────────────────
-
-    async def _ft(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/ft — Bear FVG 4h + 15m SELL ≥ 6  →  setup SHORT"""
-        await u.message.reply_text(
-            "🔴 Đang quét *Bear FVG 4h + 15m SELL* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_ft()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bear FVG 4h + SELL 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "sell", "4h", "15m")
-
-    async def _ft1h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/ft1h — Bear FVG 1h + 15m SELL ≥ 6  →  setup SHORT"""
-        await u.message.reply_text(
-            "🔴 Đang quét *Bear FVG 1h + 15m SELL* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_ft1h()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bear FVG 1h + SELL 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "sell", "1h", "15m")
-
-    async def _ft1d(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/ft1d — Bear FVG 1d + 1h SELL ≥ 6  →  setup SHORT"""
-        await u.message.reply_text(
-            "🔴 Đang quét *Bear FVG 1D + 1h SELL* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_ft1d()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bear FVG 1D + SELL 1h lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "sell", "1d", "1h")
-
-    # ── /fb family (Bull FVG + BUY) ──────────────────────────────────────
-
-    async def _fb(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/fb — Bull FVG 4h + 15m BUY ≥ 6  →  setup LONG"""
-        await u.message.reply_text(
-            "🟢 Đang quét *Bull FVG 4h + 15m BUY* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_fb()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bull FVG 4h + BUY 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "buy", "4h", "15m")
-
-    async def _fb1h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/fb1h — Bull FVG 1h + 15m BUY ≥ 6  →  setup LONG"""
-        await u.message.reply_text(
-            "🟢 Đang quét *Bull FVG 1h + 15m BUY* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_fb1h()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bull FVG 1h + BUY 15m lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "buy", "1h", "15m")
-
-    async def _fb1d(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """/fb1d — Bull FVG 1d + 1h BUY ≥ 6  →  setup LONG"""
-        await u.message.reply_text(
-            "🟢 Đang quét *Bull FVG 1D + 1h BUY* toàn market (~60–90s)...",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_fb1d()
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có setup Bull FVG 1D + BUY 1h lúc này."
-            )
-            return
-        await self._send_fvg_hits(u, hits, "buy", "1d", "1h")
-
-    async def _scan_4h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /4h — Quét toàn market tìm setup BUY 4h:
-          ① EMA 5/13 vừa cross lên + nến bullish xác nhận   (Indicator 1)
-          ② Linear Regression channel 4h slope > 0 (màu xanh) (Indicator 2)
-        """
-        await u.message.reply_text(
-            "🟢 Đang quét *EMA Cross + LinReg Bull 4H* toàn market (~60–90s)...\n"
-            "_Điều kiện: EMA 5/13 cross lên ✓ + LinReg channel xanh ✓_",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_4h_confluence()
-
-        if not hits:
-            await u.message.reply_text(
-                "❌ Không có token nào thỏa EMA cross + LinReg bull 4H lúc này.\n"
-                "_Thử lại sau vài nến 4H hoặc dùng /fb để xem Bull FVG 4H._",
-                parse_mode="Markdown"
-            )
-            return
-
-        # Đếm tier
-        fire_cnt  = sum(1 for h in hits if h["tier"] == "🔥")
-        bolt_cnt  = sum(1 for h in hits if h["tier"] == "⚡")
-        pin_cnt   = sum(1 for h in hits if h["tier"] == "📌")
-        over_cnt  = sum(1 for h in hits if h["overextended_up"])
-
-        header = (
-            f"🟢 *EMA Cross ↑ + LinReg Bull — 4H*\n"
-            f"📊 {len(hits)} token  🔥{fire_cnt} ⚡{bolt_cnt} 📌{pin_cnt}"
-            f"{'  ⚠️ ' + str(over_cnt) + ' overextended' if over_cnt else ''}\n"
-            f"_EMA 5/13 cross lên + LinReg slope xanh_\n"
-            f"{'─' * 30}\n"
-        )
-
-        def _row(h: dict) -> str:
-            sym   = h["symbol"].replace("USDT", "")
-            over  = " ⚠️OVR" if h["overextended_up"] else ""
-            rr_em = "🟢" if h["rr"] >= 2.0 else "🟡"
-
-            # Dòng 1: tên + giá + tier
-            line1 = f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`{over}\n"
-
-            # Dòng 2: EMA values
-            line2 = (
-                f"  EMA5:`{h['ema_fast']:.4f}` EMA13:`{h['ema_slow']:.4f}` "
-                f"{'✅Cross' if h['fresh_cross'] else ''}\n"
-            )
-
-            # Dòng 3: LinReg info
-            slope_dir = "↗" if h["slope_pct"] > 0 else "↘"
-            line3 = (
-                f"  LinReg:{slope_dir}`{h['slope_pct']:+.4f}%`  "
-                f"Mid:`{h['linreg_val']:.4f}`  "
-                f"Δ:`{h['price_vs_linreg']:+.2f}%`\n"
-            )
-
-            # Dòng 4: Trade levels + RR
-            line4 = (
-                f"  Entry:`{h['entry_price']:.4f}` "
-                f"SL:`{h['stop_loss']:.4f}` "
-                f"TP:`{h['take_profit']:.4f}` "
-                f"{rr_em}RR:{h['rr']:.1f}\n"
-            )
-
-            return line1 + line2 + line3 + line4
-
-        # Gửi theo chunk
-        chunk = header
-        for h in hits:
-            row = _row(h)
-            if len(chunk) + len(row) > 3900:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = row
-            else:
-                chunk += row
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
-
-        await u.message.reply_text(
-            f"✅ *Xong!* {len(hits)} setup 4H (EMA cross + LinReg bull).\n"
-            f"_🔥 slope mạnh + không overextended  "
-            f"⚡ slope vừa  📌 slope yếu/biên_",
-            parse_mode="Markdown"
-        )
-
-    async def _fvgscan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /fvgscan [tf]
-        Quét toàn bộ market (chỉ fetch TF được chỉ định, mặc định 4h).
-        Tìm tất cả token có giá hiện tại đang nằm TRONG vùng FVG.
-        Sort theo khoảng cách tới mid FVG (gần nhất trước).
-        """
-        args    = c.args
-        tf      = args[0].lower() if args else "4h"
-        valid_tfs = {"5m", "15m", "30m", "1h", "4h", "1d"}
-        if tf not in valid_tfs:
-            await u.message.reply_text(
-                f"⚠️ Timeframe `{tf}` không hợp lệ.\nDùng: 5m | 15m | 30m | 1h | 4h | 1d"
-            )
-            return
-
-        await u.message.reply_text(
-            f"📐 Đang quét *toàn market* — FVG `{tf}` (~60–90s)...\n"
-            f"_Chỉ lấy token giá đang NẰM TRONG vùng FVG_",
-            parse_mode="Markdown"
-        )
-
-        hits = await self.scanner.scan_fvg(tf=tf)
-
-        if not hits:
-            await u.message.reply_text(
-                f"❌ Không có token nào đang nằm trong FVG {tf} lúc này."
-            )
-            return
-
-        # Phân loại
-        bull_hits  = [h for h in hits if h["fvg_type"] == "bull"]
-        bear_hits  = [h for h in hits if h["fvg_type"] == "bear"]
-        ifvg_hits  = [h for h in hits if h["fvg_type"] not in ("bull", "bear")]
-
-        def _row(h: dict) -> str:
-            t     = h["fvg_type"]
-            emoji = "🟢" if t == "bull" else ("🔴" if t == "bear" else "🔵")
-            side  = "Bull" if t == "bull" else ("Bear" if t == "bear" else "iFVG")
-            sym   = h["symbol"].replace("USDT", "")
-            above_mid = "↑mid" if h["cur_price"] >= h["fvg_mid"] else "↓mid"
-            return (
-                f"{emoji} *{sym}*  `{h['cur_price']:.4f}`  [{side}]\n"
-                f"  Vùng: `{h['fvg_bot']:.4f}` – `{h['fvg_top']:.4f}`"
-                f"  Gap:`{h['gap_pct']:.2f}%`  Cách mid:`{h['dist_pct']:.2f}%`{above_mid}"
-                f"  _{h['age_bars']}nến_\n"
-            )
-
-        header = (
-            f"📐 *FVG Scan {tf.upper()}* — {len(hits)} token trong FVG\n"
-            f"🟢 Bull: {len(bull_hits)}  🔴 Bear: {len(bear_hits)}  🔵 iFVG: {len(ifvg_hits)}\n"
-            f"{'─'*30}\n"
-        )
-
-        # Build các section, gửi theo chunk ≤ 4000 ký tự
-        sections = []
-        if bull_hits:
-            sections.append(f"🟢 *Bullish FVG* ({len(bull_hits)} token)\n")
-            for h in bull_hits:
-                sections.append(_row(h))
-        if bear_hits:
-            sections.append(f"\n🔴 *Bearish FVG* ({len(bear_hits)} token)\n")
-            for h in bear_hits:
-                sections.append(_row(h))
-        if ifvg_hits:
-            sections.append(f"\n🔵 *iFVG* ({len(ifvg_hits)} token)\n")
-            for h in ifvg_hits:
-                sections.append(_row(h))
-
-        # Gom thành các chunk
-        chunk = header
-        for line in sections:
-            if len(chunk) + len(line) > 3900:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = line
-            else:
-                chunk += line
-        if chunk:
-            await u.message.reply_text(chunk, parse_mode="Markdown")
-
-    async def _fvg(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /fvg BTC [tf]
-        tf mặc định: 15m. Hỗ trợ: 5m 15m 30m 1h 4h 1d
-        Hiển thị Bullish FVG, Bearish FVG, iFVG còn hiệu lực gần giá nhất.
-        Logic port đúng từ Pine Script Section T3.
-        """
-        args = c.args
-        if not args:
-            await u.message.reply_text(
-                "⚠️ Dùng: /fvg BTC hoặc /fvg BTCUSDT 1h\n"
-                "Timeframe hỗ trợ: 5m 15m 30m 1h 4h 1d"
-            )
-            return
-
-        sym = args[0].upper()
-        if not sym.endswith("USDT"):
-            sym += "USDT"
-
-        tf_input = args[1].lower() if len(args) > 1 else "15m"
-        valid_tfs = {"5m", "15m", "30m", "1h", "4h", "1d"}
-        if tf_input not in valid_tfs:
-            await u.message.reply_text(
-                f"⚠️ Timeframe `{tf_input}` không hợp lệ.\n"
-                f"Dùng: 5m | 15m | 30m | 1h | 4h | 1d"
-            )
-            return
-
-        await u.message.reply_text(
-            f"📐 Đang tính FVG cho *{sym}* ({tf_input})...",
-            parse_mode="Markdown"
-        )
-
-        df = await self.scanner.fetcher.fetch_ohlcv(sym, tf_input, limit=100)
-        if df is None or len(df) < 3:
-            await u.message.reply_text(
-                f"❌ Không lấy được dữ liệu {sym} ({tf_input}).\n"
-                f"Dùng /debug để kiểm tra kết nối."
-            )
-            return
-
-        result = detect_fvg(df, min_gap_pct=0.0, max_keep=5)
-        cur    = result["cur_price"]
-        bulls  = result["bull_fvgs"]
-        bears  = result["bear_fvgs"]
-        ifvgs  = result["ifvgs"]
-
-        def _fmt_fvg(fvg: dict, label: str, emoji: str) -> str:
-            top    = fvg["top"]
-            bot    = fvg["bottom"]
-            mid    = (top + bot) / 2
-            gap    = fvg["gap_pct"]
-            age    = fvg["age_bars"]
-            dist   = abs(mid - cur) / cur * 100 if cur > 0 else 0
-            above  = "⬆️ phía TRÊN" if mid > cur else "⬇️ phía DƯỚI"
-            status = fvg.get("status", "active")
-            status_tag = ""
-            if status == "ifvg_bull":
-                status_tag = " _(iFVG — đã phá lên)_"
-            elif status == "ifvg_bear":
-                status_tag = " _(iFVG — đã phá xuống)_"
-            return (
-                f"{emoji} *{label}*{status_tag}\n"
-                f"  Top: `{top:.4f}` | Bot: `{bot:.4f}` | Mid: `{mid:.4f}`\n"
-                f"  Gap: `{gap:.3f}%` | Cách giá: `{dist:.2f}%` {above}\n"
-                f"  ⏳ {age} nến trước\n"
-            )
-
-        lines = [
-            f"📐 *FVG — {sym}* `({tf_input})`\n"
-            f"💰 Giá hiện tại: `{cur:.4f}`\n"
-            f"{'─' * 30}\n"
-        ]
-
-        if bulls:
-            lines.append(f"🟢 *Bullish FVG* ({len(bulls)} vùng)\n")
-            for i, fvg in enumerate(bulls, 1):
-                lines.append(_fmt_fvg(fvg, f"Bull FVG #{i}", "🟩"))
-        else:
-            lines.append("🟢 *Bullish FVG*: Không có vùng hiệu lực\n")
-
-        lines.append(f"{'─' * 30}\n")
-
-        if bears:
-            lines.append(f"🔴 *Bearish FVG* ({len(bears)} vùng)\n")
-            for i, fvg in enumerate(bears, 1):
-                lines.append(_fmt_fvg(fvg, f"Bear FVG #{i}", "🟥"))
-        else:
-            lines.append("🔴 *Bearish FVG*: Không có vùng hiệu lực\n")
-
-        lines.append(f"{'─' * 30}\n")
-
-        if ifvgs:
-            lines.append(f"🔵 *iFVG* ({len(ifvgs)} vùng — đã bị phá nhưng chưa hoàn toàn)\n")
-            for i, fvg in enumerate(ifvgs, 1):
-                dir_lbl = "Bull iFVG" if fvg.get("status") == "ifvg_bull" else "Bear iFVG"
-                lines.append(_fmt_fvg(fvg, f"{dir_lbl} #{i}", "🔷"))
-        else:
-            lines.append("🔵 *iFVG*: Không có\n")
-
-        lines.append(
-            f"{'─' * 30}\n"
-            f"_📌 Dùng /fvg {sym[:-4]} 1h hoặc /fvg {sym[:-4]} 4h để xem TF khác_"
-        )
-
-        msg = "".join(lines)
-        # Chia nhỏ nếu quá dài
-        if len(msg) > 4096:
-            chunks = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
-            for chunk in chunks:
-                await u.message.reply_text(chunk, parse_mode="Markdown")
-        else:
-            await u.message.reply_text(msg, parse_mode="Markdown")
+    # ── /check ────────────────────────────────────────────────────────────
 
     async def _check(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         args = c.args
@@ -937,30 +319,53 @@ class TelegramBot:
         sym = args[0].upper()
         if not sym.endswith("USDT"):
             sym += "USDT"
-        await u.message.reply_text(f"🔍 Đang phân tích {sym} (6 TF)...")
+        await u.message.reply_text(
+            f"🔍 Đang phân tích *{sym}* "
+            f"({self.scanner.ctx_tf.upper()} ctx + {self.scanner.entry_tf.upper()} entry)...",
+            parse_mode="Markdown"
+        )
         r = await self.scanner.scan_symbol(sym)
         if r is None:
             await u.message.reply_text(
                 f"❌ Không lấy được data cho {sym}.\nDùng /debug kiểm tra kết nối."
             )
             return
-        await u.message.reply_text(_fmt(r), parse_mode="Markdown")
-
-    async def _source(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        import fetcher as f_module
-        base = getattr(f_module, "BASE", "unknown")
         await u.message.reply_text(
-            f"📡 *API Source*\n"
-            f"Base URL: `{base}`\n"
-            f"Class: `{self.scanner.fetcher.__class__.__name__}`",
+            _fmt(r, self.scanner.ctx_tf.upper(), self.scanner.entry_tf.upper()),
             parse_mode="Markdown"
         )
+
+    # ── /status ───────────────────────────────────────────────────────────
+
+    async def _status(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        await u.message.reply_text(
+            f"✅ *Bot Running*\n"
+            f"📊 Context TF : `{self.scanner.ctx_tf}` (Ceez Prime)\n"
+            f"🎯 Entry TF   : `{self.scanner.entry_tf}` (Buy Sell Signal)\n"
+            f"📐 Min Score  : {self.scanner.min_score}/7\n"
+            f"📈 Min ADX    : {self.scanner.min_adx}\n"
+            f"🔢 Max Symbols: {self.scanner.max_symbols}\n"
+            f"⏳ Cooldown   : {len(self.scanner._last_alert)} tokens\n\n"
+            f"*Logic Ceez Prime:*\n"
+            f"① EMA Stack 13/20/50/200\n"
+            f"② LinReg Slope\n"
+            f"③ Market Structure HH/HL | LH/LL\n"
+            f"④ Fibonacci 0.382–0.618\n"
+            f"⑤ CCI Zero-line\n"
+            f"⑥ ADX + DI direction\n"
+            f"*Entry Buy Sell Signal:*\n"
+            f"⑦ EMA 5×13 cross + Candle confirm\n"
+            f"*SL: ATR×{self.scanner.atr_mult_sl}  R:R {self.scanner.rr}:1*",
+            parse_mode="Markdown"
+        )
+
+    # ── /debug ────────────────────────────────────────────────────────────
 
     async def _debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("🔧 Đang debug...")
         import aiohttp
-        import fetcher as f_module
-        base    = getattr(f_module, "BASE", "https://www.okx.com")
+        import fetcher as fm
+        base    = getattr(fm, "BASE", "https://www.okx.com")
         fetcher = self.scanner.fetcher
         lines   = [f"📡 API: `{base}`"]
 
@@ -977,62 +382,36 @@ class TelegramBot:
 
         for sym in ["BTCUSDT", "ETHUSDT"]:
             try:
-                df5  = await fetcher.fetch_ohlcv(sym, "5m",  10)
-                df15 = await fetcher.fetch_ohlcv(sym, "15m", 10)
-                df1d = await fetcher.fetch_ohlcv(sym, "1d",  10)
-                ok5  = f"{len(df5)} bars"  if df5  is not None else "FAIL"
-                ok15 = f"{len(df15)} bars" if df15 is not None else "FAIL"
-                ok1d = f"{len(df1d)} bars" if df1d is not None else "FAIL"
-                close = df5["close"].iloc[-1] if df5 is not None else "?"
-                lines.append(f"✅ {sym}: 5m={ok5} 15m={ok15} 1d={ok1d} | close={close}")
+                df_ctx, df_entry = await asyncio.gather(
+                    fetcher.fetch_ohlcv(sym, self.scanner.ctx_tf,   50),
+                    fetcher.fetch_ohlcv(sym, self.scanner.entry_tf, 50),
+                )
+                ok_ctx   = f"{len(df_ctx)} bars"   if df_ctx   is not None else "FAIL"
+                ok_entry = f"{len(df_entry)} bars"  if df_entry is not None else "FAIL"
+                price    = df_entry["close"].iloc[-1] if df_entry is not None else "?"
+                lines.append(
+                    f"✅ {sym}: {self.scanner.ctx_tf}={ok_ctx} "
+                    f"{self.scanner.entry_tf}={ok_entry} | price={price}"
+                )
             except Exception as e:
                 lines.append(f"❌ {sym}: {type(e).__name__}: {str(e)[:80]}")
 
         syms = await fetcher.fetch_top_symbols(10)
-        lines.append(f"\n📋 Symbols ({len(syms)} total): {syms[:5]}")
-        lines.append(f"🎯 Min score: {self.scanner.min_score}")
+        lines.append(f"\n📋 Symbols (total): {syms[:5]}")
         await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-    async def _status(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text(
-            f"✅ *Bot v3.1 Running*\n"
-            f"📊 Cooldown tokens: {len(self.scanner._last_alert)}\n"
-            f"🎯 Min score: {self.scanner.min_score}\n"
-            f"🔢 Max tokens/scan: {self.scanner.max_symbols}\n\n"
-            f"🔧 *Engine*\n"
-            f"• SXL Sniper (5 confluences, 0–10pt)\n"
-            f"• ST AI + UT Bot + SAR + SMC\n"
-            f"• RSI MTF 6 TF\n"
-            f"• MTF 3 tầng (5m/30m/1h+4h+1d)\n"
-            f"• ULTRA Score 0–11\n"
-            f"• Zone Classifier\n"
-            f"• Spike Detector + Leverage Advisor\n"
-            f"• EMA 5/13 Crossover Signal (4H)\n"
-            f"• Linear Regression Channel Bull (4H)\n\n"
-            f"📈 *Lệnh mới*\n"
-            f"• /4h — EMA cross ↑ + LinReg bull 4H\n\n"
-            f"Dùng /debug để test kết nối API",
-            parse_mode="Markdown"
-        )
+    # ── Auto alert ────────────────────────────────────────────────────────
 
     async def send_signal(self, chat_id: str, result: SignalResult):
-        """Gửi auto alert — ưu tiên ULTRA verdict."""
         try:
-            ultra_max = max(result.ultra_buy_score, result.ultra_sell_score,
-                        result.ultra_1h_buy,    result.ultra_1h_sell,
-                        result.ultra_4h_buy,    result.ultra_4h_sell,
-                        result.ultra_1d_buy,    result.ultra_1d_sell)
-            if ultra_max >= 9:
-                prefix = "🚨🚀 *AUTO ALERT — STRONG*"
-            elif ultra_max >= 7:
-                prefix = "🚨✅ *AUTO ALERT*"
-            else:
-                prefix = "🚨 *AUTO ALERT*"
-            if result.is_premium:
-                prefix += " ⭐ PREMIUM"
+            prefix = "🚨⭐ *AUTO ALERT — PERFECT*" if result.score == 7 else \
+                     "🚨🔥 *AUTO ALERT — STRONG*"  if result.score >= 5 else \
+                     "🚨 *AUTO ALERT*"
+            if result.signal_fresh:
+                prefix += " 🆕"
             await self.app.bot.send_message(
                 chat_id=chat_id,
-                text=f"{prefix}\n\n{_fmt(result)}",
+                text=f"{prefix}\n\n{_fmt(result, self.scanner.ctx_tf.upper(), self.scanner.entry_tf.upper())}",
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -1040,3 +419,6 @@ class TelegramBot:
 
     def run_polling(self):
         self.app.run_polling(drop_pending_updates=True)
+
+
+import asyncio  # noqa: E402 — dùng cho _debug
