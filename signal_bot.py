@@ -229,6 +229,7 @@ class TelegramBot:
             ("fb",       self._fb),
             ("fb1h",     self._fb1h),
             ("fb1d",     self._fb1d),
+            ("4h",       self._scan_4h),
             ("check",    self._check),
             ("status",   self._status),
             ("debug",    self._debug),
@@ -265,6 +266,11 @@ class TelegramBot:
             "/fb1h    — Bull FVG 1h  ×  BUY score 15m\n"
             "/fb1d    — Bull FVG 1D  ×  BUY score 1h\n"
             "_Tier: 🔥 buy≥9+trong   ⚡ buy≥8   📌 buy≥6_\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📈 *Setup LONG — EMA Cross + LinReg Bull*\n"
+            "_EMA 5/13 vừa cross lên + kênh hồi quy slope xanh trên 4H_\n"
+            "/4h      — EMA 5/13 cross ↑ × LinReg channel bull (4H)\n"
+            "_Tier: 🔥 slope mạnh  ⚡ slope vừa  📌 slope yếu_\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "📐 *FVG thủ công*\n"
             "/fvgscan `[tf]`  — Toàn market đang NẰM TRONG FVG\n"
@@ -323,127 +329,25 @@ class TelegramBot:
         )
 
     async def _top(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
-        """
-        /top — Composite scan toàn thị trường.
-        Gộp TẤT CẢ điều kiện (/scan, /fb, /ft, /fb1h, /ft1h, /fb1d, /ft1d):
-          ULTRA score (15m/1h/4h/1d) + FVG (bull/bear × 3TF)
-          + Sweep + CHoCH + VolSpike + RR + SXL + Premium
-        Sort #1 = lệnh chuẩn nhất, lợi nhuận cao nhất.
-        """
-        await u.message.reply_text(
-            "🏆 Đang tính *Composite Score* toàn market (~90–120s)…\n"
-            "_Gộp mọi điều kiện: ULTRA + FVG + Sweep + CHoCH + RR_",
-            parse_mode="Markdown"
-        )
-        hits = await self.scanner.scan_top_composite()
-        if not hits:
+        await u.message.reply_text("🔍 Đang lấy top tín hiệu (ultra≥8)...")
+        signals = await self.scanner.scan_all()
+        if not signals:
             await u.message.reply_text("❌ Không có tín hiệu. Dùng /debug kiểm tra.")
             return
-
-        # Thống kê nhanh
-        long_cnt    = sum(1 for h in hits if h["direction"] == "LONG")
-        short_cnt   = sum(1 for h in hits if h["direction"] == "SHORT")
-        sniper_cnt  = sum(1 for h in hits if h.get("signal_status") == "🎰SNIPER")
-        fvg_cnt     = sum(1 for h in hits if h["has_fvg"])
-        premium_cnt = sum(1 for h in hits if h["is_premium"])
-
-        summary = (
-            f"🏆 *TOP COMPOSITE* — {len(hits)} token\n"
-            f"🟢 LONG:{long_cnt}  🔴 SHORT:{short_cnt}  "
-            f"🎰 Sniper:{sniper_cnt}  📐 FVG:{fvg_cnt}  ⭐ Premium:{premium_cnt}\n"
-            f"_Điểm tổng hợp 0–100: ULTRA×4 + FVG×3 + Confluence×3 + SXL + RR_\n"
-            f"{'─'*30}\n"
-        )
-        await u.message.reply_text(summary, parse_mode="Markdown")
-
-        def _row_top(rank: int, h: dict) -> str:
-            dir_em  = "🟢" if h["direction"] == "LONG" else "🔴"
-            sym     = h["symbol"].replace("USDT", "")
-            prem    = " ⭐" if h["is_premium"] else ""
-            cmp     = h["composite"]
-            badge   = "🚀" if cmp >= 70 else ("✅" if cmp >= 50 else "📊")
-
-            # Dòng 1: rank + symbol + composite + hướng
-            line1 = (
-                f"*#{rank}* {badge} {dir_em} *{sym}*{prem}  "
-                f"Score:`{cmp:.0f}/100`  `{h['cur_price']:.4f}`\n"
-            )
-
-            # Dòng 2: ULTRA breakdown
-            line2 = (
-                f"  ULTRA 15m:`{h['ultra_15m_b']}↑{h['ultra_15m_s']}↓` "
-                f"1h:`{h['ultra_1h_b']}↑{h['ultra_1h_s']}↓` "
-                f"4h:`{h['ultra_4h_b']}↑{h['ultra_4h_s']}↓` "
-                f"1d:`{h['ultra_1d_b']}↑{h['ultra_1d_s']}↓`\n"
-            )
-
-            # Dòng 3: FVG info (nếu có) hoặc ULTRA verdict
-            if h["has_fvg"]:
-                fvg_em  = "🟢" if h["direction"] == "LONG" else "🔴"
-                pos_tag = "✅trong" if h.get("inside") else "🔔gần"
-                status  = h.get("signal_status", "📊ACTIVE")
-                tier    = h.get("tier", "📌")
-                fvg_sc  = h.get("fvg_score", 0)
-                fvg_tf  = h.get("fvg_tf", "—")
-                dist    = h.get("dist_pct", 0.0)
-                line3 = (
-                    f"  {fvg_em}FVG-{fvg_tf} {tier}{status} {pos_tag} "
-                    f"FVGsc:`{fvg_sc}/11`  Cách mid:`{dist:.2f}%`\n"
-                )
-            else:
-                v15 = h.get("ultra_verdict", "")
-                v1h = h.get("ultra_1h_verdict", "")
-                line3 = f"  _ULTRA: {v15} | 1H: {v1h}_\n"
-
-            # Dòng 4: Confluence indicators
-            conf_parts = []
-            if h.get("liq_swept"):
-                conf_parts.append(f"💧Sweep({h.get('liq_bars_ago',0)}n)")
-            if h.get("choch_ok"):
-                conf_parts.append(f"🔄CHoCH({h.get('choch_bars_ago',0)}n)")
-            if h.get("vol_spike"):
-                conf_parts.append(f"⚡Vol×{h.get('vol_ratio',1.0):.1f}")
-            rr = h.get("rr", 0.0)
-            rr_em = "🟢" if h.get("rr_ok") else "🟡"
-            conf_parts.append(f"{rr_em}RR:{rr:.1f}")
-            line4 = f"  {' '.join(conf_parts)}\n"
-
-            # Dòng 5: SL / TP (nếu có từ FVG)
-            sl_p  = h.get("sl_price", 0.0)
-            tp_p  = h.get("tp_price", 0.0)
-            sl_pc = h.get("sl_pct",   0.0)
-            tp_pc = h.get("tp_pct",   0.0)
-            if sl_p > 0 and tp_p > 0:
-                line5 = (
-                    f"  🛑`{sl_p:.4f}`(-{sl_pc:.2f}%)  "
-                    f"🎯`{tp_p:.4f}`(+{tp_pc:.2f}%)  "
-                    f"SXL:`{h['sxl_score']}/10` Lev:`{h['leverage']}x`\n"
-                )
-            else:
-                line5 = (
-                    f"  SXL:`{h['sxl_score']}/10`  "
-                    f"Lev:`{h['leverage']}x` {h['lev_risk']}\n"
-                )
-
-            return line1 + line2 + line3 + line4 + line5
-
-        # Gom theo chunk
+        lines = [f"🏆 *Top Tín Hiệu (ultra≥8)* — {len(signals)} token\n"]
+        for i, r in enumerate(signals, 1):
+            badge = "🚀" if max(r.ultra_buy_score, r.ultra_sell_score) >= 9 else "✅"
+            lines.append(f"*#{i}* {badge} {_fmt_short(r)}\n")
+        # Chia nhỏ nếu quá 4096 ký tự
         chunk = ""
-        for rank, h in enumerate(hits, 1):
-            row = _row_top(rank, h) + "\n"
-            if len(chunk) + len(row) > 3800:
+        for line in lines:
+            if len(chunk) + len(line) > 3800:
                 await u.message.reply_text(chunk, parse_mode="Markdown")
-                chunk = row
+                chunk = line
             else:
-                chunk += row
+                chunk += line
         if chunk:
             await u.message.reply_text(chunk, parse_mode="Markdown")
-
-        await u.message.reply_text(
-            f"✅ *Xong!* Top {len(hits)} token theo Composite Score.\n"
-            f"_#1 = chuẩn nhất, lợi nhuận tiềm năng cao nhất_",
-            parse_mode="Markdown"
-        )
 
     async def _strong(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         """
@@ -456,7 +360,8 @@ class TelegramBot:
         symbols = await self.scanner.fetcher.fetch_top_symbols(self.scanner.max_symbols)
 
         import asyncio
-        sem = asyncio.Semaphore(30)  # CONCURRENCY=30, tránh circular import
+        from scanner import CONCURRENCY
+        sem = asyncio.Semaphore(CONCURRENCY)
 
         async def _fetch_one(sym):
             async with sem:
@@ -744,6 +649,92 @@ class TelegramBot:
             return
         await self._send_fvg_hits(u, hits, "buy", "1d", "1h")
 
+    async def _scan_4h(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """
+        /4h — Quét toàn market tìm setup BUY 4h:
+          ① EMA 5/13 vừa cross lên + nến bullish xác nhận   (Indicator 1)
+          ② Linear Regression channel 4h slope > 0 (màu xanh) (Indicator 2)
+        """
+        await u.message.reply_text(
+            "🟢 Đang quét *EMA Cross + LinReg Bull 4H* toàn market (~60–90s)...\n"
+            "_Điều kiện: EMA 5/13 cross lên ✓ + LinReg channel xanh ✓_",
+            parse_mode="Markdown"
+        )
+        hits = await self.scanner.scan_4h_confluence()
+
+        if not hits:
+            await u.message.reply_text(
+                "❌ Không có token nào thỏa EMA cross + LinReg bull 4H lúc này.\n"
+                "_Thử lại sau vài nến 4H hoặc dùng /fb để xem Bull FVG 4H._",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Đếm tier
+        fire_cnt  = sum(1 for h in hits if h["tier"] == "🔥")
+        bolt_cnt  = sum(1 for h in hits if h["tier"] == "⚡")
+        pin_cnt   = sum(1 for h in hits if h["tier"] == "📌")
+        over_cnt  = sum(1 for h in hits if h["overextended_up"])
+
+        header = (
+            f"🟢 *EMA Cross ↑ + LinReg Bull — 4H*\n"
+            f"📊 {len(hits)} token  🔥{fire_cnt} ⚡{bolt_cnt} 📌{pin_cnt}"
+            f"{'  ⚠️ ' + str(over_cnt) + ' overextended' if over_cnt else ''}\n"
+            f"_EMA 5/13 cross lên + LinReg slope xanh_\n"
+            f"{'─' * 30}\n"
+        )
+
+        def _row(h: dict) -> str:
+            sym   = h["symbol"].replace("USDT", "")
+            over  = " ⚠️OVR" if h["overextended_up"] else ""
+            rr_em = "🟢" if h["rr"] >= 2.0 else "🟡"
+
+            # Dòng 1: tên + giá + tier
+            line1 = f"{h['tier']} *{sym}*  `{h['cur_price']:.4f}`{over}\n"
+
+            # Dòng 2: EMA values
+            line2 = (
+                f"  EMA5:`{h['ema_fast']:.4f}` EMA13:`{h['ema_slow']:.4f}` "
+                f"{'✅Cross' if h['fresh_cross'] else ''}\n"
+            )
+
+            # Dòng 3: LinReg info
+            slope_dir = "↗" if h["slope_pct"] > 0 else "↘"
+            line3 = (
+                f"  LinReg:{slope_dir}`{h['slope_pct']:+.4f}%`  "
+                f"Mid:`{h['linreg_val']:.4f}`  "
+                f"Δ:`{h['price_vs_linreg']:+.2f}%`\n"
+            )
+
+            # Dòng 4: Trade levels + RR
+            line4 = (
+                f"  Entry:`{h['entry_price']:.4f}` "
+                f"SL:`{h['stop_loss']:.4f}` "
+                f"TP:`{h['take_profit']:.4f}` "
+                f"{rr_em}RR:{h['rr']:.1f}\n"
+            )
+
+            return line1 + line2 + line3 + line4
+
+        # Gửi theo chunk
+        chunk = header
+        for h in hits:
+            row = _row(h)
+            if len(chunk) + len(row) > 3900:
+                await u.message.reply_text(chunk, parse_mode="Markdown")
+                chunk = row
+            else:
+                chunk += row
+        if chunk:
+            await u.message.reply_text(chunk, parse_mode="Markdown")
+
+        await u.message.reply_text(
+            f"✅ *Xong!* {len(hits)} setup 4H (EMA cross + LinReg bull).\n"
+            f"_🔥 slope mạnh + không overextended  "
+            f"⚡ slope vừa  📌 slope yếu/biên_",
+            parse_mode="Markdown"
+        )
+
     async def _fvgscan(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         """
         /fvgscan [tf]
@@ -1004,7 +995,7 @@ class TelegramBot:
 
     async def _status(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
-            f"✅ *Bot v3.0 Running*\n"
+            f"✅ *Bot v3.1 Running*\n"
             f"📊 Cooldown tokens: {len(self.scanner._last_alert)}\n"
             f"🎯 Min score: {self.scanner.min_score}\n"
             f"🔢 Max tokens/scan: {self.scanner.max_symbols}\n\n"
@@ -1015,7 +1006,11 @@ class TelegramBot:
             f"• MTF 3 tầng (5m/30m/1h+4h+1d)\n"
             f"• ULTRA Score 0–11\n"
             f"• Zone Classifier\n"
-            f"• Spike Detector + Leverage Advisor\n\n"
+            f"• Spike Detector + Leverage Advisor\n"
+            f"• EMA 5/13 Crossover Signal (4H)\n"
+            f"• Linear Regression Channel Bull (4H)\n\n"
+            f"📈 *Lệnh mới*\n"
+            f"• /4h — EMA cross ↑ + LinReg bull 4H\n\n"
             f"Dùng /debug để test kết nối API",
             parse_mode="Markdown"
         )
