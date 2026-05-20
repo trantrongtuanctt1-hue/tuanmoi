@@ -1,7 +1,16 @@
 """
 main.py — entry point
-Chạy: python main.py
+Env vars:
+  TELEGRAM_TOKEN   — bắt buộc
+  MIN_SCORE        — ngưỡng context score, default 4 (tối đa 7)
+  MAX_TOKENS       — số token quét, default 500
+  CTX_TF           — context TF (Ceez Prime),     default 4h
+  ENTRY_TF         — entry TF (Buy Sell Signal),  default 1h
+  MIN_ADX          — ngưỡng ADX,                  default 20
+  ATR_MULT_SL      — ATR multiplier cho SL,        default 0.5
+  RR               — Risk:Reward ratio,            default 3.0
 """
+
 import asyncio
 import logging
 import os
@@ -14,21 +23,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fetcher  import BybitFetcher
-from scanner  import Scanner
-from signal_bot import TelegramBot
+from fetcher     import BybitFetcher
+from scanner     import Scanner
+from signal_bot  import TelegramBot
 
 
 def main():
     token      = os.environ["TELEGRAM_TOKEN"]
-    min_score  = int(os.environ.get("MIN_ALERT_SCORE", "8"))
-    max_tokens = int(os.environ.get("MAX_TOKENS", "1000"))
+    min_score  = int(os.environ.get("MIN_SCORE",    "4"))
+    max_tokens = int(os.environ.get("MAX_TOKENS",   "500"))
+    ctx_tf     = os.environ.get("CTX_TF",   "4h")
+    entry_tf   = os.environ.get("ENTRY_TF", "1h")
+    min_adx    = float(os.environ.get("MIN_ADX",      "20"))
+    atr_mult   = float(os.environ.get("ATR_MULT_SL",  "0.5"))
+    rr         = float(os.environ.get("RR",            "3.0"))
 
-    logger.info("Starting 15M ULTRA Signal Bot (OKX, %d tokens, ultra≥%d)…", max_tokens, min_score)
+    logger.info(
+        "Starting Ceez Prime + Buy Sell Signal Bot | "
+        f"ctx={ctx_tf} entry={entry_tf} score≥{min_score}/7 "
+        f"ADX≥{min_adx} SL×{atr_mult} RR={rr} tokens={max_tokens}"
+    )
 
-    fetcher_bot = BybitFetcher()
-    scanner_bot = Scanner(fetcher_bot, min_score=min_score, max_symbols=max_tokens)
-    bot         = TelegramBot(token, scanner_bot)
+    fetcher = BybitFetcher()
+    scanner = Scanner(
+        fetcher      = fetcher,
+        min_score    = min_score,
+        max_symbols  = max_tokens,
+        ctx_tf       = ctx_tf,
+        entry_tf     = entry_tf,
+        min_adx      = min_adx,
+        atr_mult_sl  = atr_mult,
+        rr           = rr,
+    )
+    bot = TelegramBot(token, scanner)
 
     logger.info("Bot polling started. Press Ctrl+C to stop.")
     bot.run_polling()
