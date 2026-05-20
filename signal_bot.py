@@ -456,8 +456,7 @@ class TelegramBot:
         symbols = await self.scanner.fetcher.fetch_top_symbols(self.scanner.max_symbols)
 
         import asyncio
-        from scanner import CONCURRENCY
-        sem = asyncio.Semaphore(CONCURRENCY)
+        sem = asyncio.Semaphore(30)  # CONCURRENCY=30, tránh circular import
 
         async def _fetch_one(sym):
             async with sem:
