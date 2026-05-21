@@ -5,6 +5,7 @@ Commands:
   /scan4h1h    — 4H ctx + 1H entry (default)
   /scan1d4h    — 1D ctx + 4H entry (swing)
   /scan1h15m   — 1H ctx + 15m entry (intraday)
+  /1d          — Dual scan: 1D+4H & 1H+15m cùng lúc (fresh cross ưu tiên)
   /top         — Top signal rút gọn
   /check BTC   — Phân tích chi tiết
   /status      — Trạng thái bot
@@ -180,6 +181,7 @@ class TelegramBot:
             ("scan4h1h", self._scan_4h1h),
             ("scan1d4h", self._scan_1d4h),
             ("scan1h15m",self._scan_1h15m),
+            ("1d",       self._scan_1d_dual),
             ("top",      self._top),
             ("check",    self._check),
             ("status",   self._status),
@@ -202,6 +204,8 @@ class TelegramBot:
             "/scan4h1h  — 4H context + 1H entry\n"
             "/scan1d4h  — 1D context + 4H entry (swing)\n"
             "/scan1h15m — 1H context + 15m entry (intraday)\n"
+            "/1d        — Dual scan: *1D+4H & 1H+15m* cùng lúc\n"
+            "             Fresh cross từ cả 2 TF, dedup theo score\n"
             "/top       — Top signal rút gọn\n"
             "/check BTC — Chi tiết 1 token\n"
             "/status    — Cấu hình bot\n"
@@ -273,6 +277,65 @@ class TelegramBot:
 
     async def _scan_1h15m(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await self._do_scan(u, "1h", "15m", "1H+15m [INTRADAY]")
+
+    async def _scan_1d_dual(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
+        """
+        /1d — Dual scan: 1D+4H (swing) & 1H+15m (intraday) chạy song song.
+        Dedup theo symbol (giữ score cao hơn).
+        Mỗi signal hiển thị đúng TF pair của nó.
+        """
+        await u.message.reply_text(
+            "🔍 *Dual Scan* — 1D+4H & 1H+15m cùng lúc\n"
+            "Đang quét (~90–120s)...",
+            parse_mode="Markdown"
+        )
+
+        pairs = await self.scanner.scan_dual("1d", "4h", "1h", "15m")
+
+        if not pairs:
+            await u.message.reply_text(
+                "❌ Không có tín hiệu đủ điều kiện.\n"
+                "Thị trường ranging hoặc /debug để kiểm tra."
+            )
+            return
+
+        signals = [r for r, _ in pairs]
+        l_cnt   = sum(1 for r in signals if r.direction == "LONG")
+        s_cnt   = sum(1 for r in signals if r.direction == "SHORT")
+        p_cnt   = sum(1 for r in signals if r.score >= 10)
+        st_cnt  = sum(1 for r in signals if 8 <= r.score < 10)
+        fresh_cnt  = sum(1 for r in signals if r.has_fresh_cross)
+        recent_cnt = sum(1 for r in signals if r.has_recent_cross)
+        setup_cnt  = len(signals) - fresh_cnt - recent_cnt
+
+        tf_cnt: dict[str, int] = {}
+        for _, lbl in pairs:
+            tf_cnt[lbl] = tf_cnt.get(lbl, 0) + 1
+
+        tf_str = "  ".join(f"{lbl}: {n}" for lbl, n in tf_cnt.items())
+        await u.message.reply_text(
+            f"📊 *Dual Scan* — *{len(pairs)} tín hiệu sau dedup*\n"
+            f"🟢 LONG: {l_cnt}  🔴 SHORT: {s_cnt}\n"
+            f"⭐ Perfect(≥10): {p_cnt}  🔥 Strong(8-9): {st_cnt}\n"
+            f"🆕 Fresh(≤3bar): {fresh_cnt}  📍 Recent(4-8bar): {recent_cnt}  ⏳ Setup: {setup_cnt}\n"
+            f"📐 TF breakdown: {tf_str}",
+            parse_mode="Markdown"
+        )
+
+        for r, tf_label in pairs:
+            ctx_tf, entry_tf = tf_label.split("+")
+            try:
+                await u.message.reply_text(
+                    f"🕐 `[{tf_label}]`\n" + _fmt(r, ctx_tf, entry_tf),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.warning(f"send {r.symbol}: {e}")
+
+        await u.message.reply_text(
+            f"✅ Đã gửi {len(pairs)} tín hiệu (Dual 1D+4H & 1H+15m).",
+            parse_mode="Markdown"
+        )
 
     async def _top(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("🔍 Lấy top signal...")
