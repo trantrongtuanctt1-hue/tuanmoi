@@ -221,8 +221,8 @@ def calc_fib_zone(df: pd.DataFrame, lookback: int = 60) -> dict:
     else:           zone = "EQ↓"
 
     return {
-        "in_long_zone":  45.0 <= pct <= 65.0,   # equilibrium dưới
-        "in_short_zone": 35.0 <= pct <= 55.0,   # equilibrium trên
+        "in_long_zone":  38.0 <= pct <= 65.0,    # discount → equilibrium
+        "in_short_zone": 35.0 <= pct <= 62.0,    # premium → equilibrium
         "pct":      round(pct, 1),
         "zone":     zone,
         "fib_382":  round(fib_382, 8),
@@ -371,7 +371,7 @@ def detect_entry_signal(
     sell_cross = False
     bars_ago   = 0
 
-    for i in range(1, 3):  # chỉ 0 hoặc 1 bar ago
+    for i in range(1, 5):  # fresh = ≤2 bar, còn ≤4 bar vẫn lấy
         try:
             f_cur, f_prev = fast.iloc[-i],   fast.iloc[-i - 1]
             s_cur, s_prev = slow.iloc[-i],   slow.iloc[-i - 1]
@@ -431,7 +431,7 @@ def detect_entry_signal(
         "buy_cross":    buy_cross,
         "sell_cross":   sell_cross,
         "cross_bars_ago": bars_ago,
-        "signal_fresh": bars_ago <= 1,
+        "signal_fresh": bars_ago <= 2,
         "candle_strong":    candle_strong,
         "body_ratio":       round(body_ratio, 2),
         "volume_spike":     volume_spike,
