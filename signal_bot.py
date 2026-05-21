@@ -126,6 +126,13 @@ def _fmt_short(r: SignalResult) -> str:
     bar = _score_bar(r.score)
     fi  = _fib_icon(r.fib_zone)
     ri  = _risk_icon(r.risk_pct)
+    # Cross status tag
+    if r.has_fresh_cross:
+        xtag = f"🆕FRESH({r.cross_bars_ago}bar)"
+    elif r.has_recent_cross:
+        xtag = f"📍RECENT({r.cross_bars_ago}bar)"
+    else:
+        xtag = "⏳SETUP(no cross)"
 
     flags = (
         f"EMA{_yn(r.ema_stack)} LR{_yn(r.linreg_bull)} MS{_yn(r.struct_ok)} "
@@ -140,7 +147,7 @@ def _fmt_short(r: SignalResult) -> str:
             f"TP1`{r.tp1}` 🏁`{r.tp_final}`\n"
         )
     return (
-        f"{de} *{r.symbol}*  {r.direction}  `{r.score}/11`\n"
+        f"{de} *{r.symbol}*  {r.direction}  `{r.score}/11`  {xtag}\n"
         f"  `{bar}`\n"
         f"  {flags}\n"
         f"{sl_tp}"
@@ -192,7 +199,8 @@ class TelegramBot:
             "*11 điểm filter:*\n"
             "Context (6): EMA Stack · LinReg · Structure · Fib · CCI · ADX\n"
             "Entry   (5): EMA5×13 Cross · Candle Body · Volume · RSI · Price Side\n\n"
-            "*Pass khi:* score≥7/11 · ADX≥25 · SL 0.3–4% · ctx≥4/6 · entry≥3/5",
+            "*Pass khi:* score≥5/11 · ADX≥20 · SL 0.2–5% · ctx≥3/6 · entry≥2/5
+Fresh cross (≤2 bar) ưu tiên xếp đầu danh sách",
             parse_mode="Markdown"
         )
 
@@ -306,7 +314,8 @@ class TelegramBot:
             f"  Fibonacci 0.45–0.65 · CCI zero · ADX≥{self.scanner.min_adx}\n\n"
             f"*Entry (5pt):* EMA5×13 Fresh · Candle≥55%\n"
             f"  Volume≥1.3× · RSI 30–70 · Price vs EMA13\n\n"
-            f"*Risk filter:* SL 0.3–4%  R:R {self.scanner.rr}:1",
+            f"*Risk filter:* SL 0.2–5%  R:R {self.scanner.rr}:1\n"
+            f"*Sort:* Fresh cross → Score → Risk%",
             parse_mode="Markdown"
         )
 
