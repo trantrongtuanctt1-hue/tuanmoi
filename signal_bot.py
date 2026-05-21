@@ -337,20 +337,32 @@ class TelegramBot:
     async def _debug(self, u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text("🔧 Đang debug...")
         import aiohttp
-        import fetcher as fm
-        base    = getattr(fm, "BASE", "https://www.okx.com")
         fetcher = self.scanner.fetcher
-        lines   = [f"📡 API: `{base}`"]
+        source  = getattr(fetcher, "active_source", "Unknown")
+        lines   = [f"📡 *Nguồn đang dùng: {source}*"]
+
+        # Ping Binance
         try:
             session = await fetcher._get_session()
             async with session.get(
-                f"{base}/api/v5/public/time",
+                "https://fapi.binance.com/fapi/v1/ping",
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                lines.append(f"🌐 Binance: HTTP {resp.status} {'✅' if resp.status==200 else '❌'}")
+        except Exception as e:
+            lines.append(f"🌐 Binance: FAILED ({e})")
+
+        # Ping OKX
+        try:
+            session = await fetcher._get_session()
+            async with session.get(
+                "https://www.okx.com/api/v5/public/time",
                 timeout=aiohttp.ClientTimeout(total=10)
             ) as resp:
                 body = await resp.json()
-                lines.append(f"🌐 Ping: HTTP {resp.status} code={body.get('code','?')}")
+                lines.append(f"🌐 OKX: HTTP {resp.status} code={body.get('code','?')} {'✅' if resp.status==200 else '❌'}")
         except Exception as e:
-            lines.append(f"🌐 Ping FAILED: {e}")
+            lines.append(f"🌐 OKX: FAILED ({e})")
 
         for sym in ["BTCUSDT", "ETHUSDT"]:
             try:
