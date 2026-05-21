@@ -199,8 +199,8 @@ class TelegramBot:
             "*11 điểm filter:*\n"
             "Context (6): EMA Stack · LinReg · Structure · Fib · CCI · ADX\n"
             "Entry   (5): EMA5×13 Cross · Candle Body · Volume · RSI · Price Side\n\n"
-            "*Pass khi:* score≥5/11 · ADX≥20 · SL 0.2–5% · ctx≥3/6 · entry≥2/5
-Fresh cross (≤2 bar) ưu tiên xếp đầu danh sách",
+            "*Pass khi:* score≥6/11 · ADX≥20 · SL 0.2-5% · ctx≥3/6 · entry≥3/5\n"
+            "Sort: Fresh(<=3bar) -> Recent(4-8bar) -> Setup(cho cross)",
             parse_mode="Markdown"
         )
 
