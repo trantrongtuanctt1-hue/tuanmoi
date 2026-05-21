@@ -2,16 +2,15 @@
 main.py — entry point
 Env vars:
   TELEGRAM_TOKEN   — bắt buộc
-  MIN_SCORE        — ngưỡng context score, default 4 (tối đa 7)
+  MIN_SCORE        — ngưỡng score, default 7 (tối đa 11)
   MAX_TOKENS       — số token quét, default 500
-  CTX_TF           — context TF (Ceez Prime),     default 4h
-  ENTRY_TF         — entry TF (Buy Sell Signal),  default 1h
-  MIN_ADX          — ngưỡng ADX,                  default 20
-  ATR_MULT_SL      — ATR multiplier cho SL,        default 0.5
-  RR               — Risk:Reward ratio,            default 3.0
+  CTX_TF           — context TF, default 4h
+  ENTRY_TF         — entry TF,   default 1h
+  MIN_ADX          — ngưỡng ADX, default 25
+  ATR_MULT_SL      — ATR × SL,   default 0.5
+  RR               — Risk:Reward, default 3.0
 """
 
-import asyncio
 import logging
 import os
 from dotenv import load_dotenv
@@ -23,25 +22,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from fetcher     import BybitFetcher
-from scanner     import Scanner
-from signal_bot  import TelegramBot
+from fetcher    import BybitFetcher
+from scanner    import Scanner
+from signal_bot import TelegramBot
 
 
 def main():
     token      = os.environ["TELEGRAM_TOKEN"]
-    min_score  = int(os.environ.get("MIN_SCORE",    "4"))
-    max_tokens = int(os.environ.get("MAX_TOKENS",   "500"))
+    min_score  = int(os.environ.get("MIN_SCORE",   "7"))
+    max_tokens = int(os.environ.get("MAX_TOKENS",  "500"))
     ctx_tf     = os.environ.get("CTX_TF",   "4h")
     entry_tf   = os.environ.get("ENTRY_TF", "1h")
-    min_adx    = float(os.environ.get("MIN_ADX",      "20"))
-    atr_mult   = float(os.environ.get("ATR_MULT_SL",  "0.5"))
-    rr         = float(os.environ.get("RR",            "3.0"))
+    min_adx    = float(os.environ.get("MIN_ADX",     "25"))
+    atr_mult   = float(os.environ.get("ATR_MULT_SL", "0.5"))
+    rr         = float(os.environ.get("RR",          "3.0"))
 
     logger.info(
-        "Starting Ceez Prime + Buy Sell Signal Bot | "
-        f"ctx={ctx_tf} entry={entry_tf} score≥{min_score}/7 "
-        f"ADX≥{min_adx} SL×{atr_mult} RR={rr} tokens={max_tokens}"
+        f"Starting | ctx={ctx_tf} entry={entry_tf} "
+        f"score≥{min_score}/11 ADX≥{min_adx} SL×{atr_mult} RR={rr} tokens={max_tokens}"
     )
 
     fetcher = BybitFetcher()
@@ -56,8 +54,7 @@ def main():
         rr           = rr,
     )
     bot = TelegramBot(token, scanner)
-
-    logger.info("Bot polling started. Press Ctrl+C to stop.")
+    logger.info("Bot polling started.")
     bot.run_polling()
 
 
