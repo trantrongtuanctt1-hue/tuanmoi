@@ -53,11 +53,20 @@ def _risk_icon(risk_pct: float) -> str:
 # FORMAT FULL (/check, /scan)
 # ══════════════════════════════════════════════════════════════════════════
 
+def _cross_tag(r: SignalResult) -> str:
+    if r.has_fresh_cross:
+        return f"🆕 FRESH ({r.cross_bars_ago}bar)"
+    elif r.has_recent_cross:
+        return f"📍 RECENT ({r.cross_bars_ago}bar)"
+    else:
+        return "⏳ SETUP (chờ cross)"
+
 def _fmt(r: SignalResult, ctx_tf: str = "4H", entry_tf: str = "1H") -> str:
     de    = _de(r.direction)
     grade = _grade(r.score)
     bar   = _score_bar(r.score)
     ri    = _risk_icon(r.risk_pct)
+    xtag  = _cross_tag(r)
 
     # SL/TP block
     sl_tp = ""
@@ -107,6 +116,7 @@ def _fmt(r: SignalResult, ctx_tf: str = "4H", entry_tf: str = "1H") -> str:
     return (
         f"{de} *{r.symbol}*  [{r.direction}]  {grade}\n"
         f"  Score: *{r.score}/11*  `{bar}`\n"
+        f"  {xtag}\n"
         f"{sl_tp}"
         f"{ctx}"
         f"{ent}"
@@ -226,10 +236,15 @@ class TelegramBot:
         p_cnt  = sum(1 for r in signals if r.score >= 10)
         st_cnt = sum(1 for r in signals if 8 <= r.score < 10)
 
+        fresh_cnt  = sum(1 for r in signals if r.has_fresh_cross)
+        recent_cnt = sum(1 for r in signals if r.has_recent_cross)
+        setup_cnt  = len(signals) - fresh_cnt - recent_cnt
+
         await u.message.reply_text(
             f"📊 *{label}* — *{len(signals)} tín hiệu chất lượng*\n"
             f"🟢 LONG: {l_cnt}  🔴 SHORT: {s_cnt}\n"
-            f"⭐ Perfect(≥10): {p_cnt}  🔥 Strong(8-9): {st_cnt}",
+            f"⭐ Perfect(≥10): {p_cnt}  🔥 Strong(8-9): {st_cnt}\n"
+            f"🆕 Fresh(≤3bar): {fresh_cnt}  📍 Recent(4-8bar): {recent_cnt}  ⏳ Setup: {setup_cnt}",
             parse_mode="Markdown"
         )
 
