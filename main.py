@@ -29,17 +29,17 @@ from signal_bot import TelegramBot
 
 def main():
     token      = os.environ["TELEGRAM_TOKEN"]
-    min_score  = int(os.environ.get("MIN_SCORE",   "7"))
+    min_score  = int(os.environ.get("MIN_SCORE",   "6"))
     max_tokens = int(os.environ.get("MAX_TOKENS",  "500"))
     ctx_tf     = os.environ.get("CTX_TF",   "4h")
     entry_tf   = os.environ.get("ENTRY_TF", "1h")
-    min_adx    = float(os.environ.get("MIN_ADX",     "25"))
+    min_adx    = float(os.environ.get("MIN_ADX",     "20"))
     atr_mult   = float(os.environ.get("ATR_MULT_SL", "0.5"))
     rr         = float(os.environ.get("RR",          "3.0"))
 
     logger.info(
         f"Starting | ctx={ctx_tf} entry={entry_tf} "
-        f"score≥{min_score}/11 ADX≥{min_adx} SL×{atr_mult} RR={rr} tokens={max_tokens}"
+        f"score≥{min_score}/11 ctx≥3 entry≥2 ADX≥{min_adx} SL×{atr_mult} RR={rr} tokens={max_tokens}"
     )
 
     fetcher = BybitFetcher()
