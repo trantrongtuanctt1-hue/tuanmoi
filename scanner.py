@@ -135,3 +135,38 @@ class Scanner:
         self.ctx_tf, self.entry_tf = ctx_tf, entry_tf
         try:    return await self._run_scan()
         finally: self.ctx_tf, self.entry_tf = orig_ctx, orig_entry
+
+    async def scan_dual(
+        self,
+        ctx_tf_a: str, entry_tf_a: str,
+        ctx_tf_b: str, entry_tf_b: str,
+    ) -> list[tuple[SignalResult, str]]:
+        """
+        Chạy song song 2 TF pair, merge & dedup.
+        Trả về list[(SignalResult, tf_label)] đã sort.
+        tf_label ví dụ: "1D+4H" hoặc "1H+15m"
+        Nếu cùng symbol xuất hiện ở cả 2 pair → giữ cái score cao hơn.
+        """
+        label_a = f"{ctx_tf_a.upper()}+{entry_tf_a.upper()}"
+        label_b = f"{ctx_tf_b.upper()}+{entry_tf_b.upper()}"
+
+        results_a, results_b = await asyncio.gather(
+            self.scan_tf(ctx_tf_a, entry_tf_a),
+            self.scan_tf(ctx_tf_b, entry_tf_b),
+        )
+
+        # Merge: ưu tiên score cao hơn, ghi nhận TF của từng signal
+        merged: dict[str, tuple[SignalResult, str]] = {}
+        for r in results_a:
+            merged[r.symbol] = (r, label_a)
+        for r in results_b:
+            if r.symbol not in merged or r.score > merged[r.symbol][0].score:
+                merged[r.symbol] = (r, label_b)
+
+        # Sort: fresh → recent → setup; trong nhóm score desc → risk asc
+        sorted_list = sorted(merged.values(), key=lambda x: self._sort_key(x[0]))
+        logger.info(
+            f"scan_dual({label_a} | {label_b}): "
+            f"{len(results_a)} + {len(results_b)} → merged {len(sorted_list)}"
+        )
+        return sorted_list
