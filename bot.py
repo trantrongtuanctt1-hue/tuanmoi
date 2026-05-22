@@ -1,47 +1,39 @@
 import os
 import asyncio
 import ccxt.pro as ccxt
-from telegram import Bot
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ==================== CẤU HÌNH BIẾN MÔI TRƯỜNG ====================
-# Các biến này sẽ được cấu hình an toàn trên Railway, không hardcode vào đây
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SCAN_INTERVAL_MINS = int(os.getenv("SCAN_INTERVAL_MINS", "5")) # Mặc định quét mỗi 5 phút
+CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))  # Chuyển về kiểu số nguyên để định tuyến chính xác
+SCAN_INTERVAL_MINS = int(os.getenv("SCAN_INTERVAL_MINS", "5"))
 
-# Khởi tạo Bot Telegram
-tg_bot = Bot(token=TELEGRAM_TOKEN)
-
-# Khởi tạo kết nối sàn OKX (Sử dụng CCXT công khai, không cần API Key)
+# Khởi tạo kết nối sàn OKX
 exchange = ccxt.okx({
     'enableRateLimit': True,
-    'options': {'defaultType': 'spot'} # Quét thị trường Giao ngay (Spot)
+    'options': {'defaultType': 'spot'}
 })
 
-async def scan_okx_market():
-    print("🔄 Đang bắt đầu quét toàn bộ thị trường OKX...")
+# Biến trạng thái điều khiển Bot
+bot_active = True
+
+# ==================== HÀM LOGIC QUÉT THỊ TRƯỜNG ====================
+async def run_market_scan():
+    """Hàm lõi xử lý quét toàn bộ thị trường OKX"""
     try:
-        # 1. Lấy danh sách tất cả các cặp giao dịch công khai
         await exchange.load_markets()
-        # Lọc ra các cặp có đuôi /USDT và đang hoạt động
         symbols = [s for s in exchange.symbols if s.endswith('/USDT') and exchange.markets[s]['active']]
         
-        print(f"📊 Tìm thấy {len(symbols)} cặp USDT đang hoạt động. Tiến hành phân tích...")
+        found_signals = []
         
-        # 2. Duyệt qua từng cặp tiền để check điều kiện (Ví dụ: Volume Spike)
         for symbol in symbols:
             try:
-                # Lấy dữ liệu 21 cây nến gần nhất khung 5m (hoặc thay bằng 1h, 4h tuỳ bạn)
                 ohlcv = await exchange.fetch_ohlcv(symbol, timeframe='5m', limit=21)
                 if len(ohlcv) < 21:
                     continue
                 
-                # Nến hiện tại (chưa đóng cửa hoàn toàn) là ohlcv[-1]
-                # Nến vừa đóng cửa là ohlcv[-2]
                 current_volume = ohlcv[-2][5] 
-                
-                # Tính trung bình Volume của 20 nến trước đó (từ -22 đến -3)
                 past_volumes = [candle[5] for candle in ohlcv[-21:-1]]
                 avg_volume = sum(past_volumes) / len(past_volumes)
                 
@@ -49,49 +41,136 @@ async def scan_okx_market():
                     continue
                     
                 vol_ratio = current_volume / avg_volume
-                current_price = ohlcv[-2][4] # Giá đóng cửa nến gần nhất
+                current_price = ohlcv[-2][4]
                 
-                # ĐIỀU KIỆN LỌC: Volume nến vừa rồi gấp 2.5 lần trung bình 20 nến trước
+                # Điều kiện lọc Volume Spike 2.5x
                 if vol_ratio >= 2.5:
-                    message = (
-                        f"🎯 *[OKX SCANNER] PUMP DETECTED!*\n\n"
-                        f"🪙 **Token:** `{symbol.split('/')[0]}`\n"
-                        f"💵 **Giá hiện tại:** `{current_price} USDT`\n"
-                        f"📊 **Volume Spike:** 🔥 `{vol_ratio:.2f}x` (So với MA20)\n"
-                        f"⏰ **Khung thời gian:** `5m`"
-                    )
-                    # Gửi thông báo về Telegram
-                    await tg_bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown")
-                    await asyncio.sleep(0.5) # Tránh bị Telegram chặn rate limit khi gửi nhiều
-                    
-            except Exception as e:
-                # Bỏ qua lỗi của riêng lẻ từng coin (ví dụ mất thanh khoản, lỗi API tạm thời)
+                    found_signals.append({
+                        "symbol": symbol.split('/')[0],
+                        "price": current_price,
+                        "ratio": vol_ratio
+                    })
+            except:
                 continue
-                
-            # Nghỉ ngắn giữa các lần gọi API sàn để không bị OKX ban IP
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.05) # Giảm nhẹ delay để quét nhanh hơn một chút
             
-        print("✅ Đã quét xong toàn bộ thị trường.")
-        
+        return found_signals
     except Exception as e:
-        print(f"❌ Lỗi hệ thống quét: {e}")
+        print(f"Lỗi fetch dữ liệu sàn: {e}")
+        return None
 
-async def main():
-    # Khởi chạy quét lần đầu ngay khi bật bot
-    await scan_okx_market()
+# ==================== HÀM CHẠY TỰ ĐỘNG THEO CHU KỲ ====================
+async def auto_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    """Hàm chạy ngầm được JobQueue gọi tự động"""
+    global bot_active
+    if not bot_active:
+        return  # Nếu bot đang tạm dừng thì bỏ qua chu kỳ này
+
+    print("🔄 [Chu kỳ] Đang tự động quét thị trường OKX...")
+    signals = await run_market_scan()
     
-    # Thiết lập lịch trình tự động quét ngầm
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(scan_okx_market, 'interval', minutes=SCAN_INTERVAL_MINS)
-    scheduler.start()
+    if signals:
+        for coin in signals:
+            msg = (
+                f"🎯 *[AUTO SCAN] PUMP DETECTED!*\n\n"
+                f"🪙 **Token:** `{coin['symbol']}`\n"
+                f"💵 **Giá:** `{coin['price']} USDT`\n"
+                f"📊 **Volume:** 🔥 `{coin['ratio']:.2f}x` (So với MA20)\n"
+                f"⏰ **Khung:** `5m`"
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            await asyncio.sleep(0.5)
+
+# ==================== CÁC LỆNH ĐIỀU KHIỂN (COMMANDS) ====================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /start: Kiểm tra quyền truy cập và chào mừng"""
+    if update.effective_chat.id != CHAT_ID:
+        return # Bảo mật: Chỉ phản hồi đúng Chat ID của chủ sở hữu
+        
+    menu_text = (
+        "🤖 *Hệ thống Quét OKX Pro đã sẵn sàng!*\n\n"
+        "Các lệnh bạn có thể dùng để điều khiển:\n"
+        "⚡ /scan - Kích hoạt quét toàn thị trường ngay lập tức\n"
+        "⏸️ /pause - Tạm dừng tính năng tự động quét theo chu kỳ\n"
+        "▶️ /resume - Tiếp tục tự động quét theo chu kỳ\n"
+        "📊 /status - Kiểm tra tình trạng hoạt động hiện tại của Bot"
+    )
+    await update.message.reply_text(menu_text, parse_mode="Markdown")
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /scan: Ép bot quét thị trường ngay lập tức"""
+    if update.effective_chat.id != CHAT_ID:
+        return
+        
+    await update.message.reply_text("🔍 Đang quét thủ công toàn bộ các cặp USDT trên OKX... Vui lòng đợi trong giây lát.")
+    signals = await run_market_scan()
     
-    # Giữ cho bot chạy vô hạn trên Railway
-    while True:
-        await asyncio.sleep(1)
+    if signals is None:
+        await update.message.reply_text("❌ Quá trình quét thất bại do lỗi kết nối API sàn.")
+    elif len(signals) == 0:
+        await update.message.reply_text("✅ Đã quét xong. Hiện tại không có token nào đạt đủ điều kiện Volume Spike >= 2.5x.")
+    else:
+        await update.message.reply_text(f"🚀 Tìm thấy {len(signals)} token bất thường! Đang gửi danh sách...")
+        for coin in signals:
+            msg = (
+                f"🎯 *[MANUAL SCAN] PUMP DETECTED!*\n\n"
+                f"🪙 **Token:** `{coin['symbol']}`\n"
+                f"💵 **Giá:** `{coin['price']} USDT`\n"
+                f"📊 **Volume:** 🔥 `{coin['ratio']:.2f}x`\n"
+                f"⏰ **Khung:** `5m`"
+            )
+            await context.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            await asyncio.sleep(0.5)
+
+async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /pause: Tạm dừng quét tự động"""
+    if update.effective_chat.id != CHAT_ID:
+        return
+    global bot_active
+    bot_active = False
+    await update.message.reply_text("⏸️ Đã tạm dừng chế độ tự động quét theo chu kỳ.")
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /resume: Tiếp tục quét tự động"""
+    if update.effective_chat.id != CHAT_ID:
+        return
+    global bot_active
+    bot_active = True
+    await update.message.reply_text("▶️ Đã kích hoạt lại chế độ tự động quét theo chu kỳ.")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lệnh /status: Xem trạng thái hiện tại của bot"""
+    if update.effective_chat.id != CHAT_ID:
+        return
+    status = "🟢 Đang tự động quét ngầm" if bot_active else "⏸️ Đang tạm dừng quét ngầm"
+    await update.message.reply_text(
+        f"📊 *BÁO CÁO TRẠNG THÁI BOT:*\n"
+        f"▪️ Tình trạng: {status}\n"
+        f"▪️ Chu kỳ quét: `{SCAN_INTERVAL_MINS} phút / lần`\n"
+        f"▪️ Sàn giao dịch mục tiêu: `OKX (Spot)`", 
+        parse_mode="Markdown"
+    )
+
+# ==================== HÀM KHỞI CHẠY CHÍNH ====================
+def main():
+    # Tạo ứng dụng bot tích hợp sẵn hệ thống xử lý vòng lặp (loop)
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Đăng ký các bộ xử lý lệnh (Commands)
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("pause", pause_command))
+    application.add_handler(CommandHandler("resume", resume_command))
+    application.add_handler(CommandHandler("status", status_command))
+
+    # Đăng ký Job quét ngầm tự động chạy theo chu kỳ thời gian
+    job_queue = application.job_queue
+    job_queue.run_repeating(auto_scan_job, interval=SCAN_INTERVAL_MINS * 60, first=10)
+
+    # Kích hoạt chế độ Long Polling để giữ Bot luôn lắng nghe lệnh
+    print("🚀 Bot Telegram đã được kích hoạt và đang lắng nghe lệnh trên Railway...")
+    application.run_polling()
 
 if __name__ == "__main__":
-    # Đóng kết nối sàn an toàn khi tắt bot
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    main()
