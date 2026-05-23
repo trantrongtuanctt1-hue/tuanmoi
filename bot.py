@@ -1,6 +1,6 @@
 """
-🎯 Pump Scanner Bot — Telegram Bot
-Tác giả: Tuan Trading System
+Pump Scanner Bot - Telegram Bot
+Tac gia: Tuan Trading System
 Deploy: Railway via GitHub
 """
 
@@ -22,7 +22,6 @@ from telegram.constants import ParseMode
 from src.scanner import PumpScanner
 from src.config import Config
 
-# ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     datefmt="%H:%M:%S",
@@ -30,193 +29,163 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PumpBot")
 
-# ── Config ────────────────────────────────────────────────────────────────
 cfg = Config()
 scanner = PumpScanner(cfg)
 
-# ══════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════════════════════════════════
 
 def score_bar(score: int, max_s: int = 10) -> str:
     filled = round(score / max_s * 10)
     return "🟩" * filled + "⬛" * (10 - filled)
 
+
 def score_emoji(score: int) -> str:
-    if score >= 8: return "🚀"
-    if score >= 6: return "⚡"
-    if score >= 4: return "⚠️"
+    if score >= 8:
+        return "🚀"
+    if score >= 6:
+        return "⚡"
+    if score >= 4:
+        return "⚠️"
     return "😴"
+
 
 def format_signal(sig: dict) -> str:
     s = sig["score"]
     d = sig["detail"]
     ts = datetime.utcnow().strftime("%H:%M:%S UTC")
 
-    vol_line = (
-        f"{'🔥' if d['vol_mega'] else '✅' if d['vol_spike'] else '❌'} "
-        f"Volume: `{d['vol_ratio']:.1f}x` EMA"
-    )
-    cvd_line = (
-        f"{'✅' if d['cvd_rising'] else '❌'} CVD: "
-        f"{'▲ Tăng' if d['cvd_rising'] else '▼ Giảm'}"
-        + (f" | 🔄 *Divergence!*" if d['cvd_div'] else "")
-    )
-    bb_line = (
-        f"{'🤏' if d['bb_squeeze'] else '💥' if d['bb_explode'] else '⬜'} "
-        f"BB Width: `{d['bb_width']:.2f}%` "
-        f"({'Squeeze' if d['bb_squeeze'] else 'Nổ!' if d['bb_explode'] else 'Bình thường'})"
-    )
-    smc_line = (
-        f"{'🚀' if d['bos_bull'] else '✅' if d['choch_bull'] else '❌' if d['choch_bear'] else '⏳'} "
-        f"SMC: {'BOS ↑' if d['bos_bull'] else 'CHoCH ↑' if d['choch_bull'] else 'CHoCH ↓' if d['choch_bear'] else 'Chờ...'}"
-    )
-    trend_line = (
-        f"{'📈' if d['trend_up'] else '📉' if d['trend_dn'] else '↔️'} "
-        f"Trend: {'Uptrend' if d['trend_up'] else 'Downtrend' if d['trend_dn'] else 'Sideways'}"
-    )
+    vol_icon = "🔥" if d["vol_mega"] else "✅" if d["vol_spike"] else "❌"
+    vol_line = vol_icon + " Volume: `" + str(round(d["vol_ratio"], 1)) + "x` EMA"
+
+    cvd_dir = "Giam" if not d["cvd_rising"] else "Tang"
+    cvd_icon = "✅" if d["cvd_rising"] else "❌"
+    cvd_line = cvd_icon + " CVD: " + cvd_dir + (" | Divergence!" if d["cvd_div"] else "")
+
+    bb_state = "Squeeze" if d["bb_squeeze"] else "No!" if d["bb_explode"] else "Binh thuong"
+    bb_icon = "🤏" if d["bb_squeeze"] else "💥" if d["bb_explode"] else "⬜"
+    bb_line = bb_icon + " BB Width: `" + str(round(d["bb_width"], 2)) + "%` (" + bb_state + ")"
+
+    smc_state = "BOS Bull" if d["bos_bull"] else "CHoCH Bull" if d["choch_bull"] else "CHoCH Bear" if d["choch_bear"] else "Cho..."
+    smc_icon = "🚀" if d["bos_bull"] else "✅" if d["choch_bull"] else "❌" if d["choch_bear"] else "⏳"
+    smc_line = smc_icon + " SMC: " + smc_state
+
+    tr_state = "Uptrend" if d["trend_up"] else "Downtrend" if d["trend_dn"] else "Sideways"
+    tr_icon = "📈" if d["trend_up"] else "📉" if d["trend_dn"] else "↔️"
+    trend_line = tr_icon + " Trend: " + tr_state
 
     breakdown = (
-        f"Vol:{d['vol_score']} "
-        f"CVD:{d['cvd_score']+d['cvd_div_bonus']} "
-        f"BB:{d['bb_score']} "
-        f"SMC:{d['smc_score']} "
-        f"TR:{d['trend_score']}"
+        "Vol:" + str(d["vol_score"]) +
+        " CVD:" + str(d["cvd_score"] + d["cvd_div_bonus"]) +
+        " BB:" + str(d["bb_score"]) +
+        " SMC:" + str(d["smc_score"]) +
+        " TR:" + str(d["trend_score"])
     )
 
-    return (
-        f"{score_emoji(s)} *{sig['symbol']}* — Pump Score: *{s}/10*
-"
-        f"{score_bar(s)}
-"
-        f"💰 Giá: `{sig['price']:.6g}` USDT | 📊 TF: `{sig['timeframe']}`
-"
-        f"🕐 `{ts}`
+    tv_symbol = sig["symbol"].replace("/", "")
+    tv_link = "https://www.tradingview.com/chart/?symbol=BINANCE:" + tv_symbol
 
-"
-        f"{vol_line}
-"
-        f"{cvd_line}
-"
-        f"{bb_line}
-"
-        f"{smc_line}
-"
-        f"{trend_line}
+    lines = [
+        score_emoji(s) + " *" + sig["symbol"] + "* Score: *" + str(s) + "/10*",
+        score_bar(s),
+        "Gia: `" + str(round(sig["price"], 6)) + "` USDT | TF: `" + sig["timeframe"] + "`",
+        "Time: `" + ts + "`",
+        "",
+        vol_line,
+        cvd_line,
+        bb_line,
+        smc_line,
+        trend_line,
+        "",
+        "Breakdown: `" + breakdown + "` = *" + str(s) + "/10*",
+        "[TradingView](" + tv_link + ")",
+    ]
+    return "\n".join(lines)
 
-"
-        f"📊 Breakdown: `{breakdown}` = *{s}/10*
-"
-        f"🔗 [TradingView](https://www.tradingview.com/chart/?symbol=BINANCE:{sig['symbol'].replace('/', '')})"
-    )
-
-# ══════════════════════════════════════════════════════════════════════════
-#  COMMANDS
-# ══════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [
         [
             InlineKeyboardButton("🔍 Scan Ngay", callback_data="scan_now"),
-            InlineKeyboardButton("⚙️ Cài Đặt", callback_data="settings"),
+            InlineKeyboardButton("⚙️ Cai Dat", callback_data="settings"),
         ],
         [
             InlineKeyboardButton("📊 Top Signals", callback_data="top_signals"),
-            InlineKeyboardButton("ℹ️ Hướng dẫn", callback_data="help"),
+            InlineKeyboardButton("ℹ️ Huong dan", callback_data="help"),
         ],
     ]
-    markup = InlineKeyboardMarkup(kb)
     await update.message.reply_text(
-        "🎯 *Pump Scanner Bot* — by Tuan
-
-"
-        "Bot tự động scan và phát hiện token có khả năng pump dựa trên:
-"
-        "📊 Volume Spike | 📈 CVD | 📉 BB Squeeze
-"
-        "🏛️ SMC CHoCH/BOS | 🔭 EMA Trend
-
-"
-        f"⏱ Auto-scan mỗi `{cfg.SCAN_INTERVAL}` phút
-"
-        f"🎯 Ngưỡng alert: Score ≥ `{cfg.MIN_SCORE}/10`
-"
-        f"📋 Scan top `{cfg.TOP_N}` token",
+        "*Pump Scanner Bot* by Tuan\n\n"
+        "Bot scan phat hien token co kha nang pump:\n"
+        "Volume Spike | CVD | BB Squeeze | SMC | EMA Trend\n\n"
+        "Auto-scan moi `" + str(cfg.SCAN_INTERVAL) + "` phut\n"
+        "Nguong alert: Score >= `" + str(cfg.MIN_SCORE) + "/10`\n"
+        "Scan top `" + str(cfg.TOP_N) + "` token",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=markup,
+        reply_markup=InlineKeyboardMarkup(kb),
     )
 
+
 async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Đang scan... vui lòng chờ")
+    msg = await update.message.reply_text("Dang scan... vui long cho")
     try:
         results = await scanner.scan_all()
-        hot = [r for r in results if r["score"] >= cfg.MIN_SCORE]
-        hot.sort(key=lambda x: x["score"], reverse=True)
+        hot = sorted([r for r in results if r["score"] >= cfg.MIN_SCORE],
+                     key=lambda x: x["score"], reverse=True)
 
         if not hot:
             await msg.edit_text(
-                f"😴 Không tìm thấy token nào đạt ≥ {cfg.MIN_SCORE}/10
-"
-                f"Đã scan {len(results)} token. Thử lại sau."
+                "Khong tim thay token nao dat >= " + str(cfg.MIN_SCORE) + "/10\n"
+                "Da scan " + str(len(results)) + " token."
             )
             return
 
-        header = f"🔥 *Pump Scan — {len(hot)} signals* | {datetime.utcnow().strftime('%H:%M UTC')}
-{'─'*30}
-
-"
-        await msg.edit_text(header + "
-
-".join([format_signal(r) for r in hot[:5]]),
+        header = "*Pump Scan - " + str(len(hot)) + " signals* | " + datetime.utcnow().strftime("%H:%M UTC") + "\n\n"
+        first_batch = "\n\n".join([format_signal(r) for r in hot[:5]])
+        await msg.edit_text(header + first_batch,
                             parse_mode=ParseMode.MARKDOWN,
                             disable_web_page_preview=True)
 
-        # Nếu nhiều hơn 5 kết quả, gửi tiếp
         for chunk in [hot[i:i+5] for i in range(5, len(hot), 5)]:
             await update.message.reply_text(
-                "
-
-".join([format_signal(r) for r in chunk]),
+                "\n\n".join([format_signal(r) for r in chunk]),
                 parse_mode=ParseMode.MARKDOWN,
                 disable_web_page_preview=True,
             )
     except Exception as e:
-        logger.error(f"Scan error: {e}")
-        await msg.edit_text(f"❌ Lỗi scan: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        logger.error("Scan error: " + str(e))
+        await msg.edit_text("Loi scan: `" + str(e) + "`", parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_top(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Top signals với filter theo score"""
     args = ctx.args
     min_s = int(args[0]) if args and args[0].isdigit() else cfg.MIN_SCORE
-
-    msg = await update.message.reply_text(f"⏳ Đang tìm top signals (score ≥ {min_s})...")
+    msg = await update.message.reply_text("Dang tim top signals (score >= " + str(min_s) + ")...")
     try:
         results = await scanner.scan_all()
         hot = sorted([r for r in results if r["score"] >= min_s],
                      key=lambda x: x["score"], reverse=True)[:10]
 
         if not hot:
-            await msg.edit_text(f"😴 Không có signal nào ≥ {min_s}/10")
+            await msg.edit_text("Khong co signal nao >= " + str(min_s) + "/10")
             return
 
-        lines = [f"🏆 *Top Signals (score ≥ {min_s})* — {len(hot)} kết quả
-"]
+        lines = ["*Top Signals (score >= " + str(min_s) + ")* - " + str(len(hot)) + " ket qua\n"]
         for i, r in enumerate(hot, 1):
             d = r["detail"]
+            smc_txt = "BOS" if d["bos_bull"] else "CHoCH" if d["choch_bull"] else "..."
+            bb_txt = "Squeeze" if d["bb_squeeze"] else "OK"
             lines.append(
-                f"{i}. {score_emoji(r['score'])} *{r['symbol']}* `{r['score']}/10` "
-                f"| Vol:`{d['vol_ratio']:.1f}x` "
-                f"| {'🚀BOS' if d['bos_bull'] else '✅CHoCH' if d['choch_bull'] else '⏳'} "
-                f"| BB:`{'Squeeze' if d['bb_squeeze'] else 'OK'}`"
+                str(i) + ". " + score_emoji(r["score"]) + " *" + r["symbol"] + "* `" + str(r["score"]) + "/10`"
+                " | Vol:`" + str(round(d["vol_ratio"], 1)) + "x`"
+                " | " + smc_txt +
+                " | BB:`" + bb_txt + "`"
             )
 
-        await msg.edit_text("
-".join(lines), parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await msg.edit_text(f"❌ Lỗi: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text("Loi: `" + str(e) + "`", parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Check 1 token cụ thể: /check BTCUSDT 15"""
     args = ctx.args
     if not args:
         await update.message.reply_text("Usage: `/check BTCUSDT 15`", parse_mode=ParseMode.MARKDOWN)
@@ -227,7 +196,7 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         symbol += "USDT"
     tf = args[1] if len(args) > 1 else cfg.TIMEFRAME
 
-    msg = await update.message.reply_text(f"⏳ Đang phân tích `{symbol}` [{tf}]...",
+    msg = await update.message.reply_text("Dang phan tich `" + symbol + "` [" + tf + "]...",
                                            parse_mode=ParseMode.MARKDOWN)
     try:
         result = await scanner.scan_one(symbol, tf)
@@ -235,137 +204,89 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                              parse_mode=ParseMode.MARKDOWN,
                              disable_web_page_preview=True)
     except Exception as e:
-        await msg.edit_text(f"❌ Lỗi: `{e}`
-Kiểm tra lại symbol.", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text("Loi: `" + str(e) + "`\nKiem tra lai symbol.", parse_mode=ParseMode.MARKDOWN)
+
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    next_scan = ctx.job_queue.jobs()[0].next_t if ctx.job_queue.jobs() else "N/A"
     await update.message.reply_text(
-        f"📡 *Bot Status*
-
-"
-        f"✅ Đang chạy
-"
-        f"⏱ Interval: `{cfg.SCAN_INTERVAL}` phút
-"
-        f"🎯 Min score: `{cfg.MIN_SCORE}/10`
-"
-        f"📋 Scan: top `{cfg.TOP_N}` token
-"
-        f"⏰ Timeframe: `{cfg.TIMEFRAME}`
-"
-        f"🕐 Next scan: `{next_scan}`",
+        "*Bot Status*\n\n"
+        "Dang chay\n"
+        "Interval: `" + str(cfg.SCAN_INTERVAL) + "` phut\n"
+        "Min score: `" + str(cfg.MIN_SCORE) + "/10`\n"
+        "Scan: top `" + str(cfg.TOP_N) + "` token\n"
+        "Timeframe: `" + cfg.TIMEFRAME + "`\n"
+        "Exchange: `" + cfg.EXCHANGE + "`",
         parse_mode=ParseMode.MARKDOWN,
     )
+
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *Hướng dẫn sử dụng*
-
-"
-        "🔹 `/scan` — Scan toàn bộ market
-"
-        "🔹 `/top [score]` — Top signals, vd: `/top 7`
-"
-        "🔹 `/check EDEN 15` — Phân tích 1 token
-"
-        "🔹 `/status` — Xem trạng thái bot
-
-"
-        "📊 *Hệ thống chấm điểm (0-10):*
-"
-        "├ Volume Spike: 2-3đ
-"
-        "├ CVD Trend: 2đ
-"
-        "├ CVD Divergence: +1đ
-"
-        "├ BB Squeeze: 2đ
-"
-        "├ SMC CHoCH/BOS: 1-2đ
-"
-        "└ EMA Trend: +1đ
-
-"
-        "🚀 Score ≥8 | ⚡ ≥6 | ⚠️ ≥4 | 😴 <4",
+        "*Huong dan su dung*\n\n"
+        "/scan - Scan toan bo market\n"
+        "/top [score] - Top signals, vd: /top 7\n"
+        "/check EDEN 15 - Phan tich 1 token\n"
+        "/status - Xem trang thai bot\n\n"
+        "*He thong cham diem (0-10):*\n"
+        "Volume Spike: 2-3d\n"
+        "CVD Trend: 2d\n"
+        "CVD Divergence: +1d\n"
+        "BB Squeeze: 2d\n"
+        "SMC CHoCH/BOS: 1-2d\n"
+        "EMA Trend: +1d\n\n"
+        "Score >=8 | >=6 | >=4 | <4",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-# ══════════════════════════════════════════════════════════════════════════
-#  CALLBACK BUTTONS
-# ══════════════════════════════════════════════════════════════════════════
 
 async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data
 
-    if data == "scan_now":
-        await q.message.reply_text("⏳ Đang scan...")
-        fake = type("obj", (object,), {"message": q.message, "effective_chat": q.message.chat})()
-        await cmd_scan(fake, ctx)
-
-    elif data == "top_signals":
-        fake = type("obj", (object,), {"message": q.message, "args": []})()
-        await cmd_top(fake, ctx)
-
-    elif data == "settings":
+    if q.data == "scan_now":
+        await q.message.reply_text("Dang scan...")
+        fake_update = type("U", (), {"message": q.message})()
+        await cmd_scan(fake_update, ctx)
+    elif q.data == "top_signals":
+        fake_update = type("U", (), {"message": q.message, "args": []})()
+        await cmd_top(fake_update, ctx)
+    elif q.data == "settings":
         await q.message.reply_text(
-            f"⚙️ *Cài đặt hiện tại*
-
-"
-            f"Min Score: `{cfg.MIN_SCORE}`
-"
-            f"Interval: `{cfg.SCAN_INTERVAL}` phút
-"
-            f"Timeframe: `{cfg.TIMEFRAME}`
-"
-            f"Top N token: `{cfg.TOP_N}`
-"
-            f"Volume x: `{cfg.VOL_MULT}x`
-"
-            f"BB Squeeze: `<{cfg.BB_SQUEEZE_THRESH}%`
-
-"
-            f"_Thay đổi qua biến môi trường Railway_",
+            "*Cai dat hien tai*\n\n"
+            "Min Score: `" + str(cfg.MIN_SCORE) + "`\n"
+            "Interval: `" + str(cfg.SCAN_INTERVAL) + "` phut\n"
+            "Timeframe: `" + cfg.TIMEFRAME + "`\n"
+            "Top N: `" + str(cfg.TOP_N) + "` token\n"
+            "Volume x: `" + str(cfg.VOL_MULT) + "x`\n"
+            "BB Squeeze: `<" + str(cfg.BB_SQUEEZE_THRESH) + "%`\n\n"
+            "_Thay doi qua Variables tren Railway_",
             parse_mode=ParseMode.MARKDOWN,
         )
+    elif q.data == "help":
+        fake_update = type("U", (), {"message": q.message})()
+        await cmd_help(fake_update, ctx)
 
-    elif data == "help":
-        fake = type("obj", (object,), {"message": q.message})()
-        await cmd_help(fake, ctx)
-
-# ══════════════════════════════════════════════════════════════════════════
-#  AUTO SCAN JOB
-# ══════════════════════════════════════════════════════════════════════════
 
 async def auto_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
-    logger.info("🔄 Auto-scan bắt đầu...")
+    logger.info("Auto-scan bat dau...")
     try:
         results = await scanner.scan_all()
         hot = sorted([r for r in results if r["score"] >= cfg.MIN_SCORE],
                      key=lambda x: x["score"], reverse=True)
 
         if not hot:
-            logger.info(f"😴 Không có signal nào ≥ {cfg.MIN_SCORE}/10")
+            logger.info("Khong co signal nao >= " + str(cfg.MIN_SCORE) + "/10")
             return
 
-        logger.info(f"🚀 {len(hot)} signals tìm thấy!")
+        logger.info(str(len(hot)) + " signals tim thay!")
         header = (
-            f"🔔 *Auto Scan* — {datetime.utcnow().strftime('%H:%M UTC')}
-"
-            f"Tìm thấy *{len(hot)}* signal ≥ {cfg.MIN_SCORE}/10
-"
-            f"{'─'*28}
-
-"
+            "*Auto Scan* - " + datetime.utcnow().strftime("%H:%M UTC") + "\n"
+            "Tim thay *" + str(len(hot)) + "* signal >= " + str(cfg.MIN_SCORE) + "/10\n"
+            "----------------------------\n\n"
         )
 
-        # Gửi từng batch 5 signal
         for i, chunk in enumerate([hot[j:j+5] for j in range(0, min(len(hot), 15), 5)]):
-            text = (header if i == 0 else "") + "
-
-".join([format_signal(r) for r in chunk])
+            text = (header if i == 0 else "") + "\n\n".join([format_signal(r) for r in chunk])
             await ctx.bot.send_message(
                 chat_id=cfg.CHAT_ID,
                 text=text,
@@ -375,24 +296,19 @@ async def auto_scan_job(ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.5)
 
     except Exception as e:
-        logger.error(f"Auto-scan lỗi: {e}")
-        await ctx.bot.send_message(cfg.CHAT_ID, f"❌ Auto-scan lỗi: `{e}`",
-                                   parse_mode=ParseMode.MARKDOWN)
+        logger.error("Auto-scan loi: " + str(e))
+        await ctx.bot.send_message(
+            cfg.CHAT_ID,
+            "Auto-scan loi: `" + str(e) + "`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
-# ══════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════
 
 def main():
-    logger.info("🚀 Pump Scanner Bot đang khởi động...")
+    logger.info("Pump Scanner Bot dang khoi dong...")
 
-    app = (
-        Application.builder()
-        .token(cfg.BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(cfg.BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("scan",   cmd_scan))
     app.add_handler(CommandHandler("top",    cmd_top))
@@ -401,16 +317,16 @@ def main():
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Auto scan job
     app.job_queue.run_repeating(
         auto_scan_job,
         interval=cfg.SCAN_INTERVAL * 60,
-        first=30,  # chờ 30s sau khi start
+        first=30,
         name="auto_scan",
     )
 
-    logger.info(f"✅ Bot ready | Scan mỗi {cfg.SCAN_INTERVAL} phút | Min score: {cfg.MIN_SCORE}")
+    logger.info("Bot ready | Scan moi " + str(cfg.SCAN_INTERVAL) + " phut | Min score: " + str(cfg.MIN_SCORE))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
