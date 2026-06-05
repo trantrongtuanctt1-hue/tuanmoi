@@ -173,8 +173,8 @@ def analyze(df: pd.DataFrame) -> dict | None:
     rsi  = calc_rsi(close, RSI_LEN)
     atr  = calc_atr(df, ATR_LEN)
 
-    # ── Current bar index (last confirmed bar = -2, current = -1) ──
-    i = -1   # last closed bar
+    # ── Dùng bar đã đóng hoàn toàn (i=-2), tránh bar đang hình thành ──
+    i = -2   # bar confirmed (đã đóng)
 
     sma_c  = sma2.iloc[i]
     ema_c  = ema1.iloc[i]
@@ -356,13 +356,16 @@ async def scan_all(bot: Bot):
         new_signals = 0
         for sig_data in signals_found:
             key = f"{sig_data['exchange']}:{sig_data['symbol']}:{sig_data['signal']}"
-            prev = signal_cache.get(f"{sig_data['exchange']}:{sig_data['symbol']}")
-
-            # Tránh gửi duplicate cùng loại signal liên tiếp
-            if prev == sig_data["signal"] and sig_data["signal"] in ("BUY", "SELL"):
+            # Lưu cache để tránh gửi trùng cùng 1 bar (dùng timestamp làm key)
+            cache_key = f"{sig_data['exchange']}:{sig_data['symbol']}:{sig_data['signal']}:{sig_data['ts']}"
+            if cache_key in signal_cache:
                 continue
-
-            signal_cache[f"{sig_data['exchange']}:{sig_data['symbol']}"] = sig_data["signal"]
+            signal_cache[cache_key] = True
+            # Giữ cache không quá lớn
+            if len(signal_cache) > 5000:
+                keys = list(signal_cache.keys())
+                for k in keys[:1000]:
+                    del signal_cache[k]
 
             msg = build_signal_message(sig_data["exchange"], sig_data["symbol"], sig_data)
             try:
@@ -384,7 +387,7 @@ async def scan_all(bot: Bot):
 
         elapsed = time.time() - scan_start
         last_scan_time = datetime.now(VN_TZ)
-        log.info(f"✅ Scan xong: {new_signals} signals mới | {len(all_symbols)} pairs | {elapsed:.1f}s")
+        log.info(f"✅ Scan xong: {new_signals} signals mới | {len(all_symbols)} pairs | {elapsed:.1f}s | found raw: {len(signals_found)}")
 
         if new_signals == 0:
             log.info("Không có tín hiệu mới")
@@ -473,6 +476,70 @@ async def cmd_help(update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
+async def cmd_debug(update, context: ContextTypes.DEFAULT_TYPE):
+    """Test indicator trực tiếp trên 1 coin — /debug BTCUSDT"""
+    args = context.args
+    symbol = (args[0].upper() if args else "BTC") 
+    symbol = symbol.replace("USDT","")
+    okx_sym = f"{symbol}/USDT:USDT"
+    
+    msg = await update.message.reply_text(f"🔬 Debug {symbol}/USDT trên OKX 1H...")
+    
+    df = await fetch_ohlcv("okx", okx_sym, "1h", 200)
+    if df is None:
+        await msg.edit_text(f"❌ Không lấy được data cho {okx_sym}")
+        return
+    
+    close = df["close"]
+    high  = df["high"]
+    open_ = df["open"]
+    ema1  = calc_ema(close, EMA_LEN)
+    sma2  = calc_sma(close, SMA_LEN)
+    delta = close.diff()
+    gain  = delta.clip(lower=0).ewm(com=RSI_LEN-1, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=RSI_LEN-1, adjust=False).mean()
+    rsi   = 100 - (100 / (1 + gain/loss.replace(0, float("nan"))))
+    
+    i = -2  # bar đã đóng
+    sma_c = sma2.iloc[i]; ema_c = ema1.iloc[i]
+    sma_p = sma2.iloc[i-1]; ema_p = ema1.iloc[i-1]
+    rsi_c = rsi.iloc[i]; rsi_p = rsi.iloc[i-1]
+    
+    buycall  = (sma_p >= ema_p) and (sma_c < ema_c) and (high.iloc[i] > sma_c)
+    sellcall = (sma_p <= ema_p) and (sma_c > ema_c) and (open_.iloc[i] > close.iloc[i])
+    buyexit  = (rsi_p >= RSI_HL) and (rsi_c < RSI_HL)
+    sellexit = (rsi_p <= RSI_LL) and (rsi_c > RSI_LL)
+    
+    # Đếm tổng signals trong 200 bars
+    buy_total = sell_total = 0
+    for j in range(51, len(df)-1):
+        sc = sma2.iloc[j]; ec = ema1.iloc[j]
+        sp = sma2.iloc[j-1]; ep = ema1.iloc[j-1]
+        if (sp >= ep) and (sc < ec) and (high.iloc[j] > sc): buy_total += 1
+        if (sp <= ep) and (sc > ec) and (open_.iloc[j] > close.iloc[j]): sell_total += 1
+    
+    sig = "🟢 BUY" if buycall else "🔴 SELL" if sellcall else "⚠️ RSI↓" if buyexit else "💡 RSI↑" if sellexit else "⏳ Không có signal"
+    
+    text = (
+        f"🔬 <b>DEBUG {symbol}/USDT — 1H (OKX)</b>\n"
+        f"{'─'*28}\n"
+        f"📊 Tổng bars: {len(df)}\n"
+        f"{'─'*28}\n"
+        f"<b>Bar[-2] (đã đóng):</b>\n"
+        f"  Close : <code>{close.iloc[i]:.4f}</code>\n"
+        f"  SMA50 : <code>{sma_c:.4f}</code>  (prev: {sma_p:.4f})\n"
+        f"  EMA5  : <code>{ema_c:.4f}</code>  (prev: {ema_p:.4f})\n"
+        f"  RSI   : <code>{rsi_c:.2f}</code>  (prev: {rsi_p:.2f})\n"
+        f"  SMA>EMA: {'✅' if sma_c > ema_c else '❌'} | SMA_p>EMA_p: {'✅' if sma_p > ema_p else '❌'}\n"
+        f"{'─'*28}\n"
+        f"🎯 Signal bar[-2]: <b>{sig}</b>\n"
+        f"📈 BUY signals (200 bars): {buy_total}\n"
+        f"📉 SELL signals (200 bars): {sell_total}\n"
+    )
+    await msg.edit_text(text, parse_mode=ParseMode.HTML)
+
+
 async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -531,6 +598,7 @@ def main():
     app.add_handler(CommandHandler("scan",  cmd_scan))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
     # Dùng PTB job_queue tích hợp — chạy cùng event loop, không conflict
