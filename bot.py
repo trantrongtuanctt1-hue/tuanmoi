@@ -332,16 +332,8 @@ async def scan_all(bot: Bot):
     log.info("🔍 Bắt đầu scan toàn bộ USDT pairs...")
 
     try:
-        # Lấy danh sách symbols song song
-        results = await asyncio.gather(
-            get_binance_symbols(),
-            get_okx_symbols(),
-            return_exceptions=True
-        )
-        all_symbols = []
-        for r in results:
-            if isinstance(r, list):
-                all_symbols.extend(r)
+        # Chỉ dùng OKX (Binance bị block IP Railway - lỗi 451)
+        all_symbols = await get_okx_symbols()
 
         log.info(f"Tổng cộng {len(all_symbols)} symbols")
 
@@ -428,7 +420,7 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
         "🚀 <b>SWING CALLS BOT</b>\n\n"
         "Bot tự động scan tín hiệu <b>BUY/SELL</b> từ indicator\n"
         "<i>SMA(50)/EMA(5) Crossover + RSI + ATR SL/TP</i>\n\n"
-        "📡 <b>Exchange:</b> Binance Futures + OKX Futures\n"
+        "📡 <b>Exchange:</b> OKX Futures (346 pairs)\n"
         "⏱ <b>Timeframe:</b> 1H\n"
         "🔁 <b>Scan mỗi:</b> 5 phút\n\n"
         "Chọn lệnh bên dưới:",
@@ -507,7 +499,7 @@ async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
             f"ℹ️ <b>TRẠNG THÁI BOT</b>\n\n"
             f"⚙️ Status: {st}\n"
             f"⏱ Scan interval: {SCAN_INTERVAL}s\n"
-            f"📡 Exchange: Binance + OKX\n"
+            f"📡 Exchange: OKX Futures\n"
             f"📊 Timeframe: 1H",
             parse_mode=ParseMode.HTML,
         )
