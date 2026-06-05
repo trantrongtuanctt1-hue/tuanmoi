@@ -30,6 +30,13 @@ OKX_SECRET       = os.environ.get("OKX_SECRET", "")
 OKX_PASSPHRASE   = os.environ.get("OKX_PASSPHRASE", "")
 SCAN_INTERVAL    = int(os.environ.get("SCAN_INTERVAL", "300"))   # seconds
 LOOKBACK_BARS    = int(os.environ.get("LOOKBACK_BARS",  "3"))    # số bar gần nhất cần check
+
+# Timeframes cần scan: 1h, 4h, 1d
+TIMEFRAMES = [
+    {"tf": "1h",  "label": "1H",  "lookback": 3},
+    {"tf": "4h",  "label": "4H",  "lookback": 2},
+    {"tf": "1d",  "label": "1D",  "lookback": 2},
+]
 VN_TZ            = pytz.timezone("Asia/Ho_Chi_Minh")
 
 # ─── Indicator params (mirror Pine Script) ───
@@ -157,7 +164,7 @@ def calc_atr(df: pd.DataFrame, length: int) -> pd.Series:
     return tr.ewm(com=length - 1, adjust=False).mean()
 
 
-def analyze(df: pd.DataFrame) -> list[dict]:
+def analyze(df: pd.DataFrame, lookback: int = None) -> list[dict]:
     """
     Scan toàn bộ bars trong LOOKBACK_BARS gần nhất (bỏ bar[-1] đang hình thành).
     Trả về LIST tất cả signals tìm được.
@@ -177,9 +184,9 @@ def analyze(df: pd.DataFrame) -> list[dict]:
     atr  = calc_atr(df, ATR_LEN)
 
     # Scan từ bar SMA_LEN+2 đến bar -2 (bỏ bar[-1] đang hình thành)
-    # LOOKBACK: số bar gần nhất cần kiểm tra (mặc định 3 = 3 giờ gần nhất)
+    lb = lookback if lookback is not None else LOOKBACK_BARS
     total = len(df)
-    scan_start_idx = max(SMA_LEN + 2, total - LOOKBACK_BARS - 1)
+    scan_start_idx = max(SMA_LEN + 2, total - lb - 1)
     scan_end_idx   = total - 1   # không bao gồm bar[-1]
 
     for idx in range(scan_start_idx, scan_end_idx):
@@ -296,11 +303,15 @@ def build_signal_message(exchange_id: str, symbol: str, sig: dict) -> str:
     e = emoji_map.get(sig["signal"], "⚡")
     now_vn = datetime.now(VN_TZ).strftime("%d/%m/%Y %H:%M")
 
+    tf_label = sig.get("tf_label", "1H")
+    bars_ago = sig.get("bars_ago", 0)
+    freshness = "🔥 FRESH" if bars_ago == 0 else f"⏱ +{bars_ago} bar"
+
     lines = [
         f"{e} <b>{signal_name.get(sig['signal'], sig['signal'])}</b>",
         f"{'─' * 28}",
-        f"💎 <b>{sym_clean}/USDT</b>  |  {ex_label}  |  1H",
-        f"⏰ {now_vn} (VN)  |  🕐 +{sig.get('bars_ago', 0)}H",
+        f"💎 <b>{sym_clean}/USDT</b>  |  {ex_label}  |  ⏱ {tf_label}",
+        f"⏰ {now_vn} (VN)  |  {freshness}",
         f"{'─' * 28}",
     ]
 
@@ -346,23 +357,31 @@ async def scan_all(bot: Bot):
     try:
         # Chỉ dùng OKX (Binance bị block IP Railway - lỗi 451)
         all_symbols = await get_okx_symbols()
+        log.info(f"Tổng cộng {len(all_symbols)} symbols × {len(TIMEFRAMES)} TF = {len(all_symbols)*len(TIMEFRAMES)} jobs")
 
-        log.info(f"Tổng cộng {len(all_symbols)} symbols")
-
-        # Scan theo batch để tránh rate limit
-        BATCH = 30
+        BATCH = 20
         signals_found = []
 
-        for batch_start in range(0, len(all_symbols), BATCH):
-            batch = all_symbols[batch_start: batch_start + BATCH]
-            tasks = [fetch_and_analyze(ex, sym) for ex, sym in batch]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for tf_cfg in TIMEFRAMES:
+            tf     = tf_cfg["tf"]
+            label  = tf_cfg["label"]
+            lb     = tf_cfg["lookback"]
+            log.info(f"📊 Scan {label}: {len(all_symbols)} pairs...")
+            tf_count = 0
 
-            for res in batch_results:
-                if isinstance(res, list):
-                    signals_found.extend(res)
+            for batch_start in range(0, len(all_symbols), BATCH):
+                batch = all_symbols[batch_start: batch_start + BATCH]
+                tasks = [fetch_and_analyze(ex, sym, timeframe=tf, tf_label=label, lookback=lb) for ex, sym in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            await asyncio.sleep(0.3)   # nhẹ rate limit
+                for res in batch_results:
+                    if isinstance(res, list):
+                        signals_found.extend(res)
+                        tf_count += len(res)
+
+                await asyncio.sleep(0.4)
+
+            log.info(f"  → {label}: {tf_count} signals raw")
 
         # Gửi signals
         new_signals = 0
@@ -399,7 +418,7 @@ async def scan_all(bot: Bot):
 
         elapsed = time.time() - scan_start
         last_scan_time = datetime.now(VN_TZ)
-        log.info(f"✅ Scan xong: {new_signals} signals mới | {len(all_symbols)} pairs | {elapsed:.1f}s | found raw: {len(signals_found)}")
+        log.info(f"✅ Scan xong: {new_signals} signals mới | {len(all_symbols)} pairs × {len(TIMEFRAMES)} TF | raw: {len(signals_found)} | {elapsed:.1f}s")
 
         if new_signals == 0:
             log.info("Không có tín hiệu mới")
@@ -411,12 +430,12 @@ async def scan_all(bot: Bot):
         scan_running = False
 
 
-async def fetch_and_analyze(exchange_id: str, symbol: str) -> list[dict]:
-    df = await fetch_ohlcv(exchange_id, symbol, timeframe="1h", limit=200)
+async def fetch_and_analyze(exchange_id: str, symbol: str, timeframe: str = "1h", tf_label: str = "1H", lookback: int = 3) -> list[dict]:
+    df = await fetch_ohlcv(exchange_id, symbol, timeframe=timeframe, limit=200)
     if df is None:
         return []
-    sigs = analyze(df)
-    return [{"exchange": exchange_id, "symbol": symbol, **s} for s in sigs]
+    sigs = analyze(df, lookback=lookback)
+    return [{"exchange": exchange_id, "symbol": symbol, "tf_label": tf_label, **s} for s in sigs]
 
 
 # ─────────────────────────────────────────────
@@ -434,6 +453,7 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
         "Bot tự động scan tín hiệu <b>BUY/SELL</b> từ indicator\n"
         "<i>SMA(50)/EMA(5) Crossover + RSI + ATR SL/TP</i>\n\n"
         "📡 <b>Exchange:</b> OKX Futures (346 pairs)\n"
+        "📊 <b>Timeframes:</b> 1H  |  4H  |  1D\n"
         "⏱ <b>Timeframe:</b> 1H\n"
         "🔁 <b>Scan mỗi:</b> 5 phút\n\n"
         "Chọn lệnh bên dưới:",
@@ -481,6 +501,7 @@ async def cmd_help(update, context: ContextTypes.DEFAULT_TYPE):
         "💡 <b>RSI Đảo Chiều Tăng</b> — RSI cắt lên 20\n\n"
         "<b>Thông số indicator:</b>\n"
         f"• EMA: {EMA_LEN} | SMA: {SMA_LEN} | RSI: {RSI_LEN}\n"
+        "• Timeframes: 1H / 4H / 1D\n"
         f"• ATR: {ATR_LEN} | SL: {SL_MULT}x | TP1: {TP1_MULT}x | TP2: {TP2_MULT}x",
         parse_mode=ParseMode.HTML,
     )
@@ -577,6 +598,7 @@ async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
             f"⚙️ Status: {st}\n"
             f"⏱ Scan interval: {SCAN_INTERVAL}s\n"
             f"📡 Exchange: OKX Futures\n"
+            f"📊 Timeframes: 1H / 4H / 1D\n"
             f"📊 Timeframe: 1H",
             parse_mode=ParseMode.HTML,
         )
