@@ -1,6 +1,5 @@
-python-telegram-bot==20.7
+python-telegram-bot[job-queue]==20.7
 ccxt==4.2.95
 pandas==2.2.0
 numpy==1.26.4
-APScheduler==3.10.4
 pytz==2024.1
