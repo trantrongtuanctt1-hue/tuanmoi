@@ -29,6 +29,7 @@ OKX_API_KEY      = os.environ.get("OKX_API_KEY", "")
 OKX_SECRET       = os.environ.get("OKX_SECRET", "")
 OKX_PASSPHRASE   = os.environ.get("OKX_PASSPHRASE", "")
 SCAN_INTERVAL    = int(os.environ.get("SCAN_INTERVAL", "300"))   # seconds
+LOOKBACK_BARS    = int(os.environ.get("LOOKBACK_BARS",  "3"))    # số bar gần nhất cần check
 VN_TZ            = pytz.timezone("Asia/Ho_Chi_Minh")
 
 # ─── Indicator params (mirror Pine Script) ───
@@ -156,12 +157,14 @@ def calc_atr(df: pd.DataFrame, length: int) -> pd.Series:
     return tr.ewm(com=length - 1, adjust=False).mean()
 
 
-def analyze(df: pd.DataFrame) -> dict | None:
+def analyze(df: pd.DataFrame) -> list[dict]:
     """
-    Replicate Pine Script logic — return signal dict or None.
+    Scan toàn bộ bars trong LOOKBACK_BARS gần nhất (bỏ bar[-1] đang hình thành).
+    Trả về LIST tất cả signals tìm được.
     """
+    results = []
     if len(df) < SMA_LEN + 5:
-        return None
+        return results
 
     close = df["close"]
     high  = df["high"]
@@ -173,82 +176,91 @@ def analyze(df: pd.DataFrame) -> dict | None:
     rsi  = calc_rsi(close, RSI_LEN)
     atr  = calc_atr(df, ATR_LEN)
 
-    # ── Dùng bar đã đóng hoàn toàn (i=-2), tránh bar đang hình thành ──
-    i = -2   # bar confirmed (đã đóng)
+    # Scan từ bar SMA_LEN+2 đến bar -2 (bỏ bar[-1] đang hình thành)
+    # LOOKBACK: số bar gần nhất cần kiểm tra (mặc định 3 = 3 giờ gần nhất)
+    total = len(df)
+    scan_start_idx = max(SMA_LEN + 2, total - LOOKBACK_BARS - 1)
+    scan_end_idx   = total - 1   # không bao gồm bar[-1]
 
-    sma_c  = sma2.iloc[i]
-    ema_c  = ema1.iloc[i]
-    sma_p  = sma2.iloc[i - 1]
-    ema_p  = ema1.iloc[i - 1]
-    rsi_c  = rsi.iloc[i]
-    rsi_p  = rsi.iloc[i - 1]
-    close_c = close.iloc[i]
-    open_c  = open_.iloc[i]
-    high_c  = high.iloc[i]
-    atr_c   = atr.iloc[i]
+    for idx in range(scan_start_idx, scan_end_idx):
+        sma_c  = sma2.iloc[idx]
+        ema_c  = ema1.iloc[idx]
+        sma_p  = sma2.iloc[idx - 1]
+        ema_p  = ema1.iloc[idx - 1]
+        rsi_c  = rsi.iloc[idx]
+        rsi_p  = rsi.iloc[idx - 1]
+        close_c = close.iloc[idx]
+        open_c  = open_.iloc[idx]
+        high_c  = high.iloc[idx]
+        low_c   = low.iloc[idx]
+        atr_c   = atr.iloc[idx]
 
-    # ── buycall: SMA crossunder EMA AND high > SMA ──
-    buycall  = (sma_p >= ema_p) and (sma_c < ema_c) and (high_c > sma_c)
-    # ── sellcall: SMA crossover EMA AND open > close (bearish candle) ──
-    sellcall = (sma_p <= ema_p) and (sma_c > ema_c) and (open_c > close_c)
+        if any(pd.isna([sma_c, ema_c, sma_p, ema_p, rsi_c, atr_c])):
+            continue
 
-    # ── RSI reversal alerts ──
-    buyexit  = (rsi_p >= RSI_HL) and (rsi_c < RSI_HL)   # RSI crossunder 80
-    sellexit = (rsi_p <= RSI_LL) and (rsi_c > RSI_LL)   # RSI crossover  20
+        # ── buycall: SMA crossunder EMA AND high > SMA ──
+        buycall  = (sma_p >= ema_p) and (sma_c < ema_c) and (high_c > sma_c)
+        # ── sellcall: SMA crossover EMA AND open > close ──
+        sellcall = (sma_p <= ema_p) and (sma_c > ema_c) and (open_c > close_c)
+        # ── RSI reversal ──
+        buyexit  = (rsi_p >= RSI_HL) and (rsi_c < RSI_HL)
+        sellexit = (rsi_p <= RSI_LL) and (rsi_c > RSI_LL)
 
-    # ── RSI extreme ──
-    rsi_overbought  = rsi_c >= RSI_OB
-    rsi_oversold    = rsi_c <= RSI_OS
+        if not (buycall or sellcall or buyexit or sellexit):
+            continue
 
-    if not (buycall or sellcall or buyexit or sellexit):
-        return None
+        if buycall:
+            signal_type = "BUY"
+        elif sellcall:
+            signal_type = "SELL"
+        elif buyexit:
+            signal_type = "RSI_REVERSAL_BEAR"
+        else:
+            signal_type = "RSI_REVERSAL_BULL"
 
-    signal_type = None
-    if buycall:
-        signal_type = "BUY"
-    elif sellcall:
-        signal_type = "SELL"
-    elif buyexit:
-        signal_type = "RSI_REVERSAL_BEAR"
-    elif sellexit:
-        signal_type = "RSI_REVERSAL_BULL"
+        entry = close_c
+        if signal_type == "BUY":
+            sl  = entry - atr_c * SL_MULT
+            tp1 = entry + atr_c * TP1_MULT
+            tp2 = entry + atr_c * TP2_MULT
+        elif signal_type == "SELL":
+            sl  = entry + atr_c * SL_MULT
+            tp1 = entry - atr_c * TP1_MULT
+            tp2 = entry - atr_c * TP2_MULT
+        else:
+            sl = tp1 = tp2 = None
 
-    entry = close_c
-    if signal_type == "BUY":
-        sl  = entry - atr_c * SL_MULT
-        tp1 = entry + atr_c * TP1_MULT
-        tp2 = entry + atr_c * TP2_MULT
-    elif signal_type == "SELL":
-        sl  = entry + atr_c * SL_MULT
-        tp1 = entry - atr_c * TP1_MULT
-        tp2 = entry - atr_c * TP2_MULT
-    else:
-        sl = tp1 = tp2 = None
+        rsi_overbought = rsi_c >= RSI_OB
+        rsi_oversold   = rsi_c <= RSI_OS
+        if rsi_overbought or rsi_oversold:
+            rsi_zone = "⚠️ EXTREME"
+        elif low_c > sma_c:
+            rsi_zone = "🟢 BULLISH ZONE"
+        elif high_c < sma_c:
+            rsi_zone = "🔴 BEARISH ZONE"
+        else:
+            rsi_zone = "🟡 NEUTRAL"
 
-    # ── RSI color logic (mirror Pine) ──
-    if rsi_overbought or rsi_oversold:
-        rsi_zone = "⚠️ EXTREME"
-    elif low.iloc[i] > sma_c:
-        rsi_zone = "🟢 BULLISH ZONE"
-    elif high.iloc[i] < sma_c:
-        rsi_zone = "🔴 BEARISH ZONE"
-    else:
-        rsi_zone = "🟡 NEUTRAL"
+        # Tính bars_ago để label "Fresh/Recent/Old"
+        bars_ago = (scan_end_idx - 1) - idx
 
-    return {
-        "signal":   signal_type,
-        "entry":    entry,
-        "sl":       sl,
-        "tp1":      tp1,
-        "tp2":      tp2,
-        "rsi":      round(rsi_c, 2),
-        "rsi_zone": rsi_zone,
-        "atr":      round(atr_c, 6),
-        "sma":      round(sma_c, 6),
-        "ema":      round(ema_c, 6),
-        "close":    close_c,
-        "ts":       df["ts"].iloc[i],
-    }
+        results.append({
+            "signal":    signal_type,
+            "entry":     entry,
+            "sl":        sl,
+            "tp1":       tp1,
+            "tp2":       tp2,
+            "rsi":       round(rsi_c, 2),
+            "rsi_zone":  rsi_zone,
+            "atr":       round(atr_c, 6),
+            "sma":       round(sma_c, 6),
+            "ema":       round(ema_c, 6),
+            "close":     close_c,
+            "ts":        df["ts"].iloc[idx],
+            "bars_ago":  bars_ago,
+        })
+
+    return results
 
 
 # ─────────────────────────────────────────────
@@ -288,7 +300,7 @@ def build_signal_message(exchange_id: str, symbol: str, sig: dict) -> str:
         f"{e} <b>{signal_name.get(sig['signal'], sig['signal'])}</b>",
         f"{'─' * 28}",
         f"💎 <b>{sym_clean}/USDT</b>  |  {ex_label}  |  1H",
-        f"⏰ {now_vn} (VN)",
+        f"⏰ {now_vn} (VN)  |  🕐 +{sig.get('bars_ago', 0)}H",
         f"{'─' * 28}",
     ]
 
@@ -347,8 +359,8 @@ async def scan_all(bot: Bot):
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for res in batch_results:
-                if isinstance(res, dict) and res:
-                    signals_found.append(res)
+                if isinstance(res, list):
+                    signals_found.extend(res)
 
             await asyncio.sleep(0.3)   # nhẹ rate limit
 
@@ -399,14 +411,12 @@ async def scan_all(bot: Bot):
         scan_running = False
 
 
-async def fetch_and_analyze(exchange_id: str, symbol: str) -> dict | None:
+async def fetch_and_analyze(exchange_id: str, symbol: str) -> list[dict]:
     df = await fetch_ohlcv(exchange_id, symbol, timeframe="1h", limit=200)
     if df is None:
-        return None
-    sig = analyze(df)
-    if sig is None:
-        return None
-    return {"exchange": exchange_id, "symbol": symbol, **sig}
+        return []
+    sigs = analyze(df)
+    return [{"exchange": exchange_id, "symbol": symbol, **s} for s in sigs]
 
 
 # ─────────────────────────────────────────────
