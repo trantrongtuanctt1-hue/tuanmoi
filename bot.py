@@ -17,7 +17,6 @@ import numpy as np
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -515,15 +514,26 @@ async def callback_handler(update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────
+# SCHEDULED JOB (dùng PTB job_queue — tránh event loop conflict)
+# ─────────────────────────────────────────────
+async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
+    await scan_all(context.bot)
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-async def main():
+def main():
     if not TELEGRAM_TOKEN:
         raise ValueError("TELEGRAM_TOKEN chưa được set!")
     if not CHAT_ID:
         raise ValueError("CHAT_ID chưa được set!")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("scan",  cmd_scan))
@@ -531,21 +541,19 @@ async def main():
     app.add_handler(CommandHandler("help",  cmd_help))
     app.add_handler(CallbackQueryHandler(callback_handler))
 
-    # Scheduler
-    scheduler = AsyncIOScheduler(timezone=VN_TZ)
-    scheduler.add_job(
-        lambda: asyncio.create_task(scan_all(app.bot)),
-        "interval",
-        seconds=SCAN_INTERVAL,
-        id="auto_scan",
-        next_run_time=datetime.now(VN_TZ),   # scan ngay khi khởi động
+    # Dùng PTB job_queue tích hợp — chạy cùng event loop, không conflict
+    job_queue = app.job_queue
+    job_queue.run_repeating(
+        scheduled_scan,
+        interval=SCAN_INTERVAL,
+        first=5,        # scan lần đầu sau 5 giây khởi động
+        name="auto_scan",
     )
-    scheduler.start()
-    log.info(f"⏰ Scheduler: scan mỗi {SCAN_INTERVAL}s")
-
+    log.info(f"⏰ Job queue: scan mỗi {SCAN_INTERVAL}s")
     log.info("🚀 SWING CALLS BOT khởi động...")
-    await app.run_polling(drop_pending_updates=True)
+
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
